@@ -1,0 +1,1 @@
+@C:\Users\admin\PycharmProjects\myTools\venv\Scripts\python.exe C:\Users\admin\PycharmProjects\myTools\rnn.py %*

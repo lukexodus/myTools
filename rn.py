@@ -1,5 +1,5 @@
 #! python3
-# rn.py (Remove Newlines) - Removes the newlines in the text from the clipboard.
+# rn.py (Remove Newlines \r\n) - Removes the newlines in the text from the clipboard.
 
 # Made for windows
 
