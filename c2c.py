@@ -4,12 +4,16 @@
 
 # Made for windows
 
-import pyperclip, re
+import pyperclip
+import re
+
 
 def replace_colons_with_entities(input_string):
     # Use re.sub() to find and replace '::' with '&colon;&colon;'
-    output_string = re.sub(r'::', ':&ZeroWidthSpace;:', input_string)
+    output_string = re.sub(
+        r'(?<!\{\{c\d)::', ':&ZeroWidthSpace;:', input_string)
     return output_string
+
 
 clipboard = pyperclip.paste()
 clipboardStr = str(clipboard)
