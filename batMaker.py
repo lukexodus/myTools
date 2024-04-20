@@ -29,11 +29,11 @@ for folderName, subfolders, filenames in os.walk(folderPath):
 
 makeBatFor = []
 for file in pyFiles:
-    text = open(file)
+    text = open(file, encoding='utf-8')
     textString = text.readlines()
     if not textString:
         continue
-    if textString[0] == "#! python3" or textString[0] == "#! python3\n":
+    if (textString[0] == "#! python3") or (textString[0] == "#! python3\n"):
         makeBatFor.append(file)
     text.close()
 
