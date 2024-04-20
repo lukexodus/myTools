@@ -31,6 +31,7 @@ makeBatFor = []
 for file in pyFiles:
     text = open(file, encoding='utf-8')
     textString = text.readlines()
+    print(textString);
     if not textString:
         continue
     if (textString[0] == "#! python3") or (textString[0] == "#! python3\n"):
@@ -53,9 +54,9 @@ for i in range(len(makeBatFor)):
 for file in notHaveBat:
     newBatName = os.path.basename(file)[: extensionLen(file)] + ".bat"
     newBatPath = os.path.join(os.path.dirname(file), newBatName)
-    newBat = open(newBatPath, "w")
+    newBat = open(newBatPath, "w", encoding='utf-8')
     if pythonExeIsInside:
-        newBat.write(f"@{pythonExeAbsPath} {file} %*")
+        newBat.write(f"\"@{pythonExeAbsPath}\" \"{file}\" %*")
     else:
-        newBat.write(f"@py.exe {file} %*")
+        newBat.write(f"@py.exe \"{file}\" %*")
     newBat.close()
