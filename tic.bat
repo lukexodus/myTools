@@ -1,1 +1,1 @@
-@C:\Users\admin\PycharmProjects\myTools\venv\Scripts\python.exe C:\Users\admin\PycharmProjects\myTools\tic.py %*
+@C:\LukeFiles\dev\repos\myTools\venv\Scripts\python.exe C:\LukeFiles\dev\repos\myTools\tic.py %*

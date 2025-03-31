@@ -1,5 +1,5 @@
 #! python3
-# bpa.py - Adds Wikipedia bullet points to the start
+# bpa.py [Bullet Point Adder] - Adds Wikipedia bullet points to the start
 # of each line of text on the clipboard.
 
 import pyperclip

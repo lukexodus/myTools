@@ -56,7 +56,7 @@ for file in notHaveBat:
     newBatPath = os.path.join(os.path.dirname(file), newBatName)
     newBat = open(newBatPath, "w", encoding='utf-8')
     if pythonExeIsInside:
-        newBat.write(f"\"@{pythonExeAbsPath}\" \"{file}\" %*")
+        newBat.write(f"@{pythonExeAbsPath} {file} %*")
     else:
-        newBat.write(f"@py.exe \"{file}\" %*")
+        newBat.write(f"@py.exe {file} %*")
     newBat.close()

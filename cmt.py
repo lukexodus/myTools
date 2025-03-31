@@ -1,6 +1,8 @@
 #! python3
 import pyperclip, sys
 
+# cmt.py [Comment Text Block] - Adds comment prefixes to each line, depending on the comment type.
+
 if len(sys.argv) != 2:
     print('Usage: cmt <COMMENT_TYPE>')
     sys.exit()

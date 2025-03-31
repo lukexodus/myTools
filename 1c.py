@@ -1,5 +1,7 @@
 #! python3
 
+# 1c.py [One Cloze number] - Sets all cloze number within the text with the specified number (this is for Anki cloze cards)
+
 import pyperclip, sys, re
 
 if len(sys.argv) == 1:
