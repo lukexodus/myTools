@@ -1,1 +1,0 @@
-@C:\LukeFiles\dev\repos\myTools\venv\Scripts\python.exe C:\LukeFiles\dev\repos\myTools\rnnc.py %*
