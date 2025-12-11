@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 # bakc.py -- Copies an entire folder and its contents into
 # a ZIP file whose filename increments by one.
