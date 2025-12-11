@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+# cm [Comment Text Block] - Adds comment prefixes to each line, depending on the comment type.
+
+# Made for Linux (Windows version commented out below)
+
+import subprocess
+import sys
+
+# ========== ORIGINAL WINDOWS VERSION (COMMENTED OUT) ==========
+# import pyperclip, sys
+#
+# if len(sys.argv) != 2:
+#     print('Usage: cmt <COMMENT_TYPE>')
+#     sys.exit()
+#
+# commentType = sys.argv[1]
+# text = pyperclip.paste()
+# lines = text.split("\n")
+#
+# if commentType == '/':
+#     for i in range(len(lines)):
+#         lines[i] = "// " + lines[i]
+#     text = "\n".join(lines)
+#     pyperclip.copy(text)
+# elif commentType == '#':
+#     for i in range(len(lines)):
+#         lines[i] = "# " + lines[i]
+#     text = "\n".join(lines)
+#     pyperclip.copy(text)
+# else:
+#     print('! Comment type not implemented !')
+#     sys.exit()
+# ===============================================================
+
+
+# ========== LINUX VERSION (using wl-clipboard) ==========
+def get_clipboard():
+    """Get clipboard content using wl-paste"""
+    try:
+        result = subprocess.run(['wl-paste'], capture_output=True, text=True, check=True)
+        return result.stdout
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("Error: Could not read clipboard. Install wl-clipboard: sudo pacman -S wl-clipboard")
+        return ""
+
+
+def set_clipboard(text):
+    """Set clipboard content using wl-copy"""
+    try:
+        subprocess.run(['wl-copy'], input=text, text=True, check=True)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("Error: Could not write to clipboard.")
+        return False
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        print('Usage: cm <COMMENT_TYPE>')
+        print('  /  - C/C++/JavaScript style (// )')
+        print('  #  - Python/Bash style (# )')
+        sys.exit(1)
+
+    commentType = sys.argv[1]
+    text = get_clipboard()
+    if not text:
+        sys.exit(1)
+    
+    # Strip trailing newline added by wl-paste
+    text = text.rstrip('\n')
+    
+    lines = text.split("\n")
+
+    if commentType == '/':
+        for i in range(len(lines)):
+            lines[i] = "// " + lines[i]
+        text = "\n".join(lines)
+    elif commentType == '#':
+        for i in range(len(lines)):
+            lines[i] = "# " + lines[i]
+        text = "\n".join(lines)
+    else:
+        print('! Comment type not implemented !')
+        print('Supported types: / or #')
+        sys.exit(1)
+    
+    if set_clipboard(text):
+        print(f"✓ Added {commentType} comments to {len(lines)} lines")
+    else:
+        sys.exit(1)

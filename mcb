@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+#  - Saves and loads pieces of text to the clipboard.
+# Usage: python3  save <keyword> - Saves clipboard to keyword.
+#        python3  <keyword> - Loads keyword to clipboard.
+#        python3  list - Loads all keywords to clipboard.
+#        python3  delete <keyword> - Deletes keyword.
+#        python3  delete all - Deletes all keywords.
+# Windows usage: py.exe  save <keyword> - Saves clipboard to keyword.
+#                py.exe  <keyword> - Loads keyword to clipboard.
+#                py.exe  list - Loads all keywords to clipboard.
+#                py.exe  delete <keyword> - Deletes keyword.
+#                py.exe  delete all - Deletes all keywords.
+
+import shelve, sys, subprocess
+# import shelve, pyperclip, sys  # Windows/pyperclip version
+mcbShelf = shelve.open('mcb')
+
+# wl-clipboard helper functions for Linux/Wayland
+def clipboard_copy(text):
+    """Copy text to clipboard using wl-copy"""
+    subprocess.run(['wl-copy'], input=text.encode('utf-8'), check=True)
+    # pyperclip.copy(text)  # Windows/pyperclip version
+
+def clipboard_paste():
+    """Paste text from clipboard using wl-paste"""
+    result = subprocess.run(['wl-paste'], capture_output=True, check=True)
+    return result.stdout.decode('utf-8')
+    # return pyperclip.paste()  # Windows/pyperclip version
+
+# Save clipboard content.
+if len(sys.argv) == 3 and sys.argv[1].lower() == 'save':
+    mcbShelf[sys.argv[2]] = clipboard_paste()
+elif len(sys.argv) == 3 and sys.argv[1].lower() == 'delete' and sys.argv[2].lower() != 'all':
+    del mcbShelf[sys.argv[2]]
+elif len(sys.argv) == 3 and sys.argv[1].lower() == 'delete' and sys.argv[2].lower() == 'all':
+    for keyword in mcbShelf.keys():
+        del mcbShelf[keyword]
+elif len(sys.argv) == 2:
+    # TODO: List keywords and load content.
+    if sys.argv[1].lower() == 'list':
+        clipboard_copy(str(dict(mcbShelf.items())))
+    elif sys.argv[1] in mcbShelf:
+        clipboard_copy(mcbShelf[sys.argv[1]])
+else:
+    usage = '''# Usage: python3  save <keyword> - Saves clipboard to keyword.
+#        python3  <keyword> - Loads keyword to clipboard.
+#        python3  list - Loads all keywords to clipboard.
+#        python3  delete <keyword> - Deletes keyword.
+#        python3  delete all - Deletes all keywords.'''
+    # Windows usage:
+    # usage = \'\'\'# Usage: py.exe  save <keyword> - Saves clipboard to keyword.
+    # #        py.exe  <keyword> - Loads keyword to clipboard.
+    # #        py.exe  list - Loads all keywords to clipboard.
+    # #        py.exe  delete <keyword> - Deletes keyword.
+    # #        py.exe  delete all - Deletes all keywords.\'\'\'
+    print(usage)
+    clipboard_copy(usage)
+    
+mcbShelf.close()

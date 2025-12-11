@@ -1,4 +1,4 @@
-#! python3
+#!/usr/bin/env python
 
 import os, sys
 
@@ -34,7 +34,7 @@ for file in pyFiles:
     print(textString);
     if not textString:
         continue
-    if (textString[0] == "#! python3") or (textString[0] == "#! python3\n"):
+    if (textString[0] == "#!/usr/bin/env python") or (textString[0] == "#!/usr/bin/env python\n"):
         makeBatFor.append(file)
     text.close()
 

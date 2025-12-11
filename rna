@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+# rn.py (Remove Newlines \r\n) - Removes the newlines in the text from the clipboard.
+
+# Made for Linux (Windows version commented out below)
+
+import subprocess
+
+# ========== ORIGINAL WINDOWS VERSION (COMMENTED OUT) ==========
+# import pyperclip
+#
+# clipboard = pyperclip.paste()
+# clipboard = str(clipboard)
+# clipboard = list(clipboard)
+# for j in range(4):
+#     clipboard.append(" ")
+# i = 0
+# while i < len(clipboard):
+#     if i == len(clipboard) - 4:
+#         break
+#     if (
+#         clipboard[i] == " "
+#         and clipboard[i + 1] == "\r"
+#         and clipboard[i + 2] == "\n"
+#         and clipboard[i + 3] == "\r"
+#         and clipboard[i + 4] == "\n"
+#     ):
+#         i += 1
+#         continue
+#
+#     elif clipboard[i] == "\r" and (
+#         (clipboard[i - 1] == "\n" and clipboard[i - 2] == "\r")
+#         or (
+#             clipboard[i + 1] == "\n"
+#             and clipboard[i + 2] == "\r"
+#             and clipboard[i + 3] == "\n"
+#         )
+#     ):
+#         i += 1
+#         continue
+#
+#     elif clipboard[i] == "\n" and (
+#         (
+#             clipboard[i - 1] == "\r"
+#             and clipboard[i - 2] == "\n"
+#             and clipboard[i - 3] == "\r"
+#         )
+#         or (clipboard[i + 1] == "\r" and clipboard[i + 2] == "\n")
+#     ):
+#         i += 1
+#         continue
+#
+#     if clipboard[i] == " " and clipboard[i + 1] == "\r" and clipboard[i + 2] == "\n":
+#         del clipboard[i]
+#         del clipboard[i]
+#         clipboard[i] = " "
+#
+#     if clipboard[i] == "\r" and clipboard[i + 1] == "\n":
+#         clipboard[i] = " "
+#         del clipboard[i + 1]
+#     i += 1
+# for k in range(4):
+#     clipboard.pop()
+#
+# pocessedText = "".join(clipboard)
+# pyperclip.copy(pocessedText)
+# ===============================================================
+
+
+# ========== LINUX VERSION (using wl-clipboard) ==========
+def get_clipboard():
+    """Get clipboard content using wl-paste"""
+    try:
+        result = subprocess.run(
+            ['wl-paste'],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        return result.stdout
+    except subprocess.CalledProcessError:
+        print("Error: Could not read from clipboard.")
+        return ""
+    except FileNotFoundError:
+        print("Error: wl-paste not found. Please install wl-clipboard:")
+        print("  sudo apt install wl-clipboard  (Debian/Ubuntu)")
+        print("  sudo dnf install wl-clipboard  (Fedora)")
+        print("  sudo pacman -S wl-clipboard    (Arch)")
+        return ""
+
+
+def set_clipboard(text):
+    """Set clipboard content using wl-copy"""
+    try:
+        subprocess.run(
+            ['wl-copy'],
+            input=text,
+            text=True,
+            check=True
+        )
+        return True
+    except subprocess.CalledProcessError:
+        print("Error: Could not write to clipboard.")
+        return False
+    except FileNotFoundError:
+        print("Error: wl-copy not found. Please install wl-clipboard first.")
+        return False
+
+
+def remove_newlines(text):
+    """Remove newlines from text using the original algorithm (handles both \r\n and \n)"""
+    clipboard = list(text)
+    
+    # Add padding to avoid index errors
+    for j in range(4):
+        clipboard.append(" ")
+    
+    i = 0
+    while i < len(clipboard):
+        if i == len(clipboard) - 4:
+            break
+        
+        # Skip double newlines after a space (Windows style)
+        if (
+            i + 4 < len(clipboard)
+            and clipboard[i] == " "
+            and clipboard[i + 1] == "\r"
+            and clipboard[i + 2] == "\n"
+            and clipboard[i + 3] == "\r"
+            and clipboard[i + 4] == "\n"
+        ):
+            i += 1
+            continue
+
+        # Skip double newlines after a space (Unix style)
+        if (
+            i + 2 < len(clipboard)
+            and clipboard[i] == " "
+            and clipboard[i + 1] == "\n"
+            and clipboard[i + 2] == "\n"
+        ):
+            i += 1
+            continue
+
+        # Skip \r in the middle of double newlines
+        elif clipboard[i] == "\r" and (
+            (i >= 2 and clipboard[i - 1] == "\n" and clipboard[i - 2] == "\r")
+            or (
+                i + 3 < len(clipboard)
+                and clipboard[i + 1] == "\n"
+                and clipboard[i + 2] == "\r"
+                and clipboard[i + 3] == "\n"
+            )
+        ):
+            i += 1
+            continue
+
+        # Skip \n in the middle of double newlines (Windows)
+        elif clipboard[i] == "\n" and (
+            (
+                i >= 3
+                and clipboard[i - 1] == "\r"
+                and clipboard[i - 2] == "\n"
+                and clipboard[i - 3] == "\r"
+            )
+            or (i + 2 < len(clipboard) and clipboard[i + 1] == "\r" and clipboard[i + 2] == "\n")
+        ):
+            i += 1
+            continue
+
+        # Skip \n in the middle of double newlines (Unix)
+        elif clipboard[i] == "\n" and (
+            (i >= 1 and clipboard[i - 1] == "\n")
+            or (i + 1 < len(clipboard) and clipboard[i + 1] == "\n")
+        ):
+            i += 1
+            continue
+
+        # Replace space + Windows newline with space
+        if i + 2 < len(clipboard) and clipboard[i] == " " and clipboard[i + 1] == "\r" and clipboard[i + 2] == "\n":
+            del clipboard[i]
+            del clipboard[i]
+            clipboard[i] = " "
+
+        # Replace space + Unix newline with space
+        elif i + 1 < len(clipboard) and clipboard[i] == " " and clipboard[i + 1] == "\n":
+            del clipboard[i]
+            clipboard[i] = " "
+
+        # Replace Windows newline with space
+        elif i + 1 < len(clipboard) and clipboard[i] == "\r" and clipboard[i + 1] == "\n":
+            clipboard[i] = " "
+            del clipboard[i + 1]
+
+        # Replace Unix newline with space
+        elif clipboard[i] == "\n":
+            clipboard[i] = " "
+        
+        i += 1
+    
+    # Remove padding
+    for k in range(4):
+        clipboard.pop()
+    
+    return "".join(clipboard)
+
+
+if __name__ == "__main__":
+    # Get clipboard content
+    clipboard_text = get_clipboard()
+    
+    if clipboard_text:
+        # Process the text
+        processed_text = remove_newlines(clipboard_text)
+        
+        # Copy back to clipboard
+        if set_clipboard(processed_text):
+            print("✓ Newlines removed and copied to clipboard successfully!")
+        else:
+            print("✗ Failed to copy to clipboard.")
+    else:
+        print("✗ No text found in clipboard or error reading clipboard.")
