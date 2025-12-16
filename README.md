@@ -192,7 +192,71 @@ Output: # code line 1
 
 ---
 
-### 🛠️ Utilities
+#### `eh` - Extract Headers
+**Functionality:** Extracts module titles from markdown headers and formats them  
+**Usage:**
+```bash
+./eh
+```
+**Example:**
+```
+Input:  ## Module 1: Foundations
+        - HTTP protocol fundamentals
+        ## Module 2: Basic Fetch Syntax
+        - fetch() function signature
+        
+Output: # Foundations
+        
+        
+        
+        ---
+        
+        # Basic Fetch Syntax
+        
+        
+        
+        ---
+```
+**Use Case:** Converting outline structures into slide-ready markdown headers
+
+---
+
+### 🖼️ Image Processing
+
+#### `attach_logo` - Batch Image Watermarking
+**Functionality:** Adds PNG watermark overlays to a folder of images (.heic, .jpg, .jpeg, .png)  
+**Usage:**
+```bash
+./attach_logo <input_directory>
+./attach_logo <input_directory> --no-left   # Disable left watermark
+./attach_logo <input_directory> --no-right  # Disable right watermark
+```
+**Features:**
+- Supports HEIC, JPG, JPEG, PNG formats
+- Adds two watermarks: logo (lower-left) and motto (lower-right)
+- Preserves image quality (configurable JPEG quality)
+- Outputs to `./with_logo/` directory
+- Customizable watermark positions, sizes, and margins
+
+**Example:**
+```bash
+./attach_logo ~/Photos/event_photos
+```
+
+**Configuration:** Edit script variables to customize:
+- `OVERLAY_LEFT` / `OVERLAY_RIGHT` - Watermark PNG paths
+- `MARGINL_X/Y` and `MARGINR_X/Y` - Position offsets
+- `OVERLAY_HEIGHT_LEFT/RIGHT` - Watermark sizes (pixels)
+- `OUTPUT_QUALITY` - JPEG quality (1-100, default: 100)
+
+**Dependencies:**
+```bash
+pip install pillow pillow-heif
+```
+
+---
+
+### �🛠️ Utilities
 
 #### `bak` - Backup to ZIP
 **Functionality:** Creates incremental ZIP backups of the current folder  
@@ -232,6 +296,7 @@ All scripts use ultra-short, intuitive names for quick typing:
 | `cm` | Comment | Add comment prefixes |
 | `hp` | Header Plus | Increase header level |
 | `hm` | Header Minus | Decrease header level |
+| `eh` | Extract Headers | Extract module titles |
 | `bak` | Backup | Create ZIP backup |
 | `mkbat` | Make Batch | Generate .bat files |
 
@@ -270,6 +335,9 @@ All scripts use ultra-short, intuitive names for quick typing:
 # Adjust header levels
 ./hp  # Make headers smaller (increase level)
 ./hm  # Make headers larger (decrease level)
+
+# Extract module titles from outlines
+./eh
 ```
 
 ### Code Formatting
