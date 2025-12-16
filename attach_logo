@@ -1,0 +1,277 @@
+
+#!/usr/bin/env python3
+"""
+Batch overlay tool for adding two PNG overlays (with transparency)
+to a folder of .heic images, with optional overlay height specification.
+
+Dependencies:
+    pip install pillow pillow-heif
+"""
+
+from PIL import Image
+import pillow_heif
+import os
+import sys
+import argparse
+
+# ========== CONFIGURATION ==========
+OUTPUT_DIR = "./with_logo"      # Where to save the composited images
+OVERLAY_LEFT = "/home/lukexodus/college/org/stallions_chess_club/graphics/watermark/logo_watermark.png"   # Lower-left overlay
+OVERLAY_RIGHT = "/home/lukexodus/college/org/stallions_chess_club/graphics/watermark/motto_watermark.png" # Lower-right overlay
+
+# Default margins (in pixels)
+DEFAULT_MARGINL_Y = 115                # Vertical margin for left overlay
+DEFAULT_MARGINL_X = 165                # Horizontal margin for left overlay
+DEFAULT_MARGINR_Y = 117                # Vertical margin for right overlay
+DEFAULT_MARGINR_X = 170                # Horizontal margin for right overlay
+
+DEFAULT_SCALE = 0.15          # Default scale for overlays (relative to base image width)
+                              # Relative to base image width (e.g., 0.15 = 15%)
+
+# Overlay scaling options by file type and orientation
+SCALING_OPTIONS = {
+    "heic": {
+        "landscape": {
+            "SCALE": DEFAULT_SCALE,                 
+            "OVERLAY_HEIGHT_LEFT": 330,    # Specify overlay height in pixels (overrides SCALE)
+            "OVERLAY_HEIGHT_RIGHT": 83,    # Specify overlay height in pixels (overrides SCALE)
+            "MARGINL_Y": DEFAULT_MARGINL_Y - 5,
+            "MARGINL_X": DEFAULT_MARGINL_X - 5,
+            "MARGINR_Y": DEFAULT_MARGINR_Y - 5,
+            "MARGINR_X": DEFAULT_MARGINR_X - 5
+        },
+        "portrait": {
+            "SCALE": DEFAULT_SCALE,
+            "OVERLAY_HEIGHT_LEFT": 350,
+            "OVERLAY_HEIGHT_RIGHT": 89,
+            "MARGINL_Y": DEFAULT_MARGINL_Y,
+            "MARGINL_X": DEFAULT_MARGINL_X,
+            "MARGINR_Y": DEFAULT_MARGINR_Y,
+            "MARGINR_X": DEFAULT_MARGINR_X
+        }
+    },
+    "jpg": {
+        "landscape": {
+            "SCALE": DEFAULT_SCALE,
+            "OVERLAY_HEIGHT_LEFT": 300,
+            "OVERLAY_HEIGHT_RIGHT": 77,
+            "MARGINL_Y": DEFAULT_MARGINL_Y - 6,
+            "MARGINL_X": DEFAULT_MARGINL_X - 6,
+            "MARGINR_Y": DEFAULT_MARGINR_Y - 6,
+            "MARGINR_X": DEFAULT_MARGINR_X - 6
+        },
+        "portrait": {
+            "SCALE": DEFAULT_SCALE,
+            "OVERLAY_HEIGHT_LEFT": 330,
+            "OVERLAY_HEIGHT_RIGHT": 83,
+            "MARGINL_Y": DEFAULT_MARGINL_Y,
+            "MARGINL_X": DEFAULT_MARGINL_X,
+            "MARGINR_Y": DEFAULT_MARGINR_Y,
+            "MARGINR_X": DEFAULT_MARGINR_X
+        }
+    },
+    "jpeg": {
+        "landscape": {
+            "SCALE": DEFAULT_SCALE,
+            "OVERLAY_HEIGHT_LEFT": 330,
+            "OVERLAY_HEIGHT_RIGHT": 83,
+            "MARGINL_Y": DEFAULT_MARGINL_Y,
+            "MARGINL_X": DEFAULT_MARGINL_X,
+            "MARGINR_Y": DEFAULT_MARGINR_Y,
+            "MARGINR_X": DEFAULT_MARGINR_X
+        },
+        "portrait": {
+            "SCALE": DEFAULT_SCALE,
+            "OVERLAY_HEIGHT_LEFT": 330,
+            "OVERLAY_HEIGHT_RIGHT": 83,
+            "MARGINL_Y": DEFAULT_MARGINL_Y,
+            "MARGINL_X": DEFAULT_MARGINL_X,
+            "MARGINR_Y": DEFAULT_MARGINR_Y,
+            "MARGINR_X": DEFAULT_MARGINR_X
+        }
+    },
+    "png": {
+        "landscape": {
+            "SCALE": DEFAULT_SCALE,
+            "OVERLAY_HEIGHT_LEFT": 350,
+            "OVERLAY_HEIGHT_RIGHT": 89,
+            "MARGINL_Y": DEFAULT_MARGINL_Y,
+            "MARGINL_X": DEFAULT_MARGINL_X,
+            "MARGINR_Y": DEFAULT_MARGINR_Y,
+            "MARGINR_X": DEFAULT_MARGINR_X
+        },
+        "portrait": {
+            "SCALE": DEFAULT_SCALE,
+            "OVERLAY_HEIGHT_LEFT": 350,
+            "OVERLAY_HEIGHT_RIGHT": 89,
+            "MARGINL_Y": DEFAULT_MARGINL_Y,
+            "MARGINL_X": DEFAULT_MARGINL_X,
+            "MARGINR_Y": DEFAULT_MARGINR_Y,
+            "MARGINR_X": DEFAULT_MARGINR_X
+        }
+    },
+    "dng": {
+        "landscape": {
+            "SCALE": DEFAULT_SCALE,
+            "OVERLAY_HEIGHT_LEFT": 350,
+            "OVERLAY_HEIGHT_RIGHT": 89,
+            "MARGINL_Y": DEFAULT_MARGINL_Y,
+            "MARGINL_X": DEFAULT_MARGINL_X,
+            "MARGINR_Y": DEFAULT_MARGINR_Y,
+            "MARGINR_X": DEFAULT_MARGINR_X
+        },
+        "portrait": {
+            "SCALE": DEFAULT_SCALE,
+            "OVERLAY_HEIGHT_LEFT": 350,
+            "OVERLAY_HEIGHT_RIGHT": 89,
+            "MARGINL_Y": DEFAULT_MARGINL_Y,
+            "MARGINL_X": DEFAULT_MARGINL_X,
+            "MARGINR_Y": DEFAULT_MARGINR_Y,
+            "MARGINR_X": DEFAULT_MARGINR_X
+        }
+    }
+}
+
+OUTPUT_FORMAT = "JPEG"       # or "PNG"
+OUTPUT_QUALITY = 100           # For JPEG output
+
+# ==================================
+
+def parse_arguments():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Batch overlay tool for adding watermarks to images."
+    )
+    parser.add_argument(
+        "input_dir",
+        help="Directory containing images to process"
+    )
+    parser.add_argument(
+        "--no-left",
+        action="store_true",
+        help="Disable the left overlay (logo watermark)"
+    )
+    parser.add_argument(
+        "--no-right",
+        action="store_true",
+        help="Disable the right overlay (motto watermark)"
+    )
+    return parser.parse_args()
+
+def get_file_extension(filename):
+    """Get the file extension without the dot."""
+    return os.path.splitext(filename)[1][1:].lower()
+
+def main():
+    # Parse arguments
+    args = parse_arguments()
+    INPUT_DIR = args.input_dir
+    use_left = not args.no_left
+    use_right = not args.no_right
+
+    # Validate that at least one overlay is enabled
+    if not use_left and not use_right:
+        print("❌ Error: At least one overlay must be enabled.")
+        print("   You cannot use both --no-left and --no-right at the same time.")
+        sys.exit(1)
+
+    # Validate input directory
+    if not os.path.isdir(INPUT_DIR):
+        print(f"❌ Error: Input directory '{INPUT_DIR}' does not exist.")
+        sys.exit(1)
+
+    # Register HEIF format
+    pillow_heif.register_heif_opener()
+
+    # Create output directory inside the input directory
+    output_dir = os.path.join(INPUT_DIR, "with_logo")
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Load overlays
+    overlay_left = Image.open(OVERLAY_LEFT).convert("RGBA") if use_left else None
+    overlay_right = Image.open(OVERLAY_RIGHT).convert("RGBA") if use_right else None
+
+    processed_count = 0
+
+    for filename in os.listdir(INPUT_DIR):
+        ext = get_file_extension(filename)
+        
+        # Check if file type is supported
+        if ext not in SCALING_OPTIONS:
+            continue
+
+        filepath = os.path.join(INPUT_DIR, filename)
+
+        # Get scaling options for this file type
+        scale_opts = SCALING_OPTIONS[ext]
+
+        # Load base image
+        base = Image.open(filepath).convert("RGBA")
+        bw, bh = base.size
+
+        # Determine orientation
+        orientation = "landscape" if bw >= bh else "portrait"
+        
+        # Get scaling options for this orientation
+        scale_opts = scale_opts[orientation]
+
+        # Composite overlays
+        composite = base.copy()
+
+        # Resize and composite left overlay if enabled
+        if use_left:
+            if scale_opts["OVERLAY_HEIGHT_LEFT"]:
+                # Fixed height
+                new_height = scale_opts["OVERLAY_HEIGHT_LEFT"]
+                new_width = int(overlay_left.width * (new_height / overlay_left.height))
+                overlay_left_resized = overlay_left.resize((new_width, new_height), Image.LANCZOS)
+            else:
+                # Scaled by base width
+                ow = int(bw * scale_opts["SCALE"])
+                overlay_left_resized = overlay_left.resize(
+                    (ow, int(overlay_left.height * (ow / overlay_left.width))), Image.LANCZOS
+                )
+
+            lw, lh = overlay_left_resized.size
+            pos_left = (scale_opts["MARGINL_X"], bh - lh - scale_opts["MARGINL_Y"])
+            composite.alpha_composite(overlay_left_resized, pos_left)
+
+        # Resize and composite right overlay if enabled
+        if use_right:
+            if scale_opts["OVERLAY_HEIGHT_RIGHT"]:
+                new_height = scale_opts["OVERLAY_HEIGHT_RIGHT"]
+                new_width = int(overlay_right.width * (new_height / overlay_right.height))
+                overlay_right_resized = overlay_right.resize((new_width, new_height), Image.LANCZOS)
+            else:
+                ow = int(bw * scale_opts["SCALE"])
+                overlay_right_resized = overlay_right.resize(
+                    (ow, int(overlay_right.height * (ow / overlay_right.width))), Image.LANCZOS
+                )
+
+            rw, rh = overlay_right_resized.size
+            pos_right = (bw - rw - scale_opts["MARGINR_X"], bh - rh - scale_opts["MARGINR_Y"])
+            composite.alpha_composite(overlay_right_resized, pos_right)
+
+        # Output path
+        out_name = os.path.splitext(filename)[0] + (
+            ".jpg" if OUTPUT_FORMAT == "JPEG" else ".png"
+        )
+        out_path = os.path.join(output_dir, out_name)
+
+        # Save file
+        if OUTPUT_FORMAT == "JPEG":
+            composite.convert("RGB").save(out_path, OUTPUT_FORMAT, quality=OUTPUT_QUALITY)
+        else:
+            composite.save(out_path, OUTPUT_FORMAT)
+
+        print(f"✅ Saved: {out_path}")
+        processed_count += 1
+
+    if processed_count == 0:
+        print(f"⚠️  No supported image files found in '{INPUT_DIR}'")
+        print(f"   Supported formats: {', '.join(SCALING_OPTIONS.keys())}")
+    else:
+        print(f"🎉 All {processed_count} images processed successfully!")
+
+if __name__ == "__main__":
+    main()
