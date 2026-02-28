@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+# rnb.py (Remove Newlines - Bullets) - Removes blank lines between bullet points
+
+import subprocess
+
+def get_clipboard():
+    """Get clipboard content using wl-paste"""
+    try:
+        result = subprocess.run(
+            ['wl-paste'],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        return result.stdout
+    except subprocess.CalledProcessError:
+        print("Error: Could not read from clipboard.")
+        return ""
+    except FileNotFoundError:
+        print("Error: wl-paste not found. Please install wl-clipboard:")
+        print("  sudo apt install wl-clipboard  (Debian/Ubuntu)")
+        print("  sudo dnf install wl-clipboard  (Fedora)")
+        print("  sudo pacman -S wl-clipboard    (Arch)")
+        return ""
+
+
+def set_clipboard(text):
+    """Set clipboard content using wl-copy"""
+    try:
+        subprocess.run(
+            ['wl-copy'],
+            input=text,
+            text=True,
+            check=True
+        )
+        return True
+    except subprocess.CalledProcessError:
+        print("Error: Could not write to clipboard.")
+        return False
+    except FileNotFoundError:
+        print("Error: wl-copy not found. Please install wl-clipboard first.")
+        return False
+
+
+def remove_bullet_newlines(text):
+    """Remove blank lines between bullet points while preserving document structure"""
+    lines = text.split('\n')
+    result = []
+    i = 0
+    
+    while i < len(lines):
+        current_line = lines[i]
+        
+        # Always add the current line
+        result.append(current_line)
+        
+        # Look ahead to see if we should skip blank lines
+        if i + 1 < len(lines):
+            # Check if current line is a bullet point or numbered list item
+            stripped = current_line.lstrip()
+            is_bullet = stripped.startswith('-') and not stripped.startswith('---')
+            is_numbered = any(stripped.startswith(f'{n}.') for n in range(1, 1000)) if stripped else False
+            is_list_item = is_bullet or is_numbered
+            
+            # Check if we have blank line(s) ahead
+            j = i + 1
+            blank_count = 0
+            while j < len(lines) and lines[j].strip() == '':
+                blank_count += 1
+                j += 1
+            
+            # If we have blank lines, check what comes after them
+            if blank_count > 0 and j < len(lines):
+                next_content = lines[j].lstrip()
+                next_is_bullet = next_content.startswith('-') and not next_content.startswith('---')
+                next_is_numbered = any(next_content.startswith(f'{n}.') for n in range(1, 1000)) if next_content else False
+                next_is_list_item = next_is_bullet or next_is_numbered
+                next_is_separator = next_content.startswith('---')
+                next_is_header = next_content.startswith('#')
+                
+                # Skip blank lines if:
+                # - Current line is a list item and next line is also a list item
+                # - Current line is NOT a separator/header and next is a list item
+                if is_list_item and next_is_list_item:
+                    # Skip the blank lines
+                    i = j
+                    continue
+                elif not (current_line.strip().startswith('---') or 
+                         current_line.strip().startswith('#')) and next_is_list_item:
+                    # Skip blank lines before list items (unless we're at a structural element)
+                    i = j
+                    continue
+                # If current line is a list item and we have multiple blank lines before separator/header
+                elif is_list_item and blank_count > 1 and (next_is_separator or next_is_header):
+                    # Keep only one blank line
+                    result.append('')
+                    i = j
+                    continue
+        
+        i += 1
+    
+    return '\n'.join(result)
+
+
+if __name__ == "__main__":
+    # Get clipboard content
+    clipboard_text = get_clipboard()
+    
+    if clipboard_text:
+        # Process the text
+        processed_text = remove_bullet_newlines(clipboard_text)
+        
+        # Copy back to clipboard
+        if set_clipboard(processed_text):
+            print("✓ Blank lines between list items removed and copied to clipboard successfully!")
+        else:
+            print("✗ Failed to copy to clipboard.")
+    else:
+        print("✗ No text found in clipboard or error reading clipboard.")

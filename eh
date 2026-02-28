@@ -47,17 +47,23 @@ def set_clipboard(text):
 def extract_module_titles(text):
     """
     Extract module titles from text.
-    Matches pattern: ## Module N: Title
-    Returns list of titles (text after '## Module N: ')
+    Matches pattern: # Title
+    Returns list of titles (text after '# ')
+    Removes prefixes like "Module 1 — " or "Module 13: "
     """
     # Pattern matches ## followed by optional whitespace, then text ending with :, then captures the title
-    pattern = r'^#+\s+[^:]+:\s+(.+)$'
+    pattern = r'^#+\s+(.+)$'
     
     titles = []
     for line in text.split('\n'):
         match = re.match(pattern, line.strip())
         if match:
-            titles.append(match.group(1))
+            title = match.group(1)
+            # Strip asterisks from beginning and end
+            title = title.strip('*')
+            # Remove "Module X — " or "Module X: " prefix
+            title = re.sub(r'^Module\s+\d+\s*[—:]\s*', '', title)
+            titles.append(title)
     
     return titles
 

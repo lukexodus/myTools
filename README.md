@@ -103,11 +103,11 @@ Output: Line 1 Line 2
 
 ---
 
-#### `code` - Transform Into Code (HTML)
+#### `wcode` - Transform Into Code (HTML)
 **Functionality:** Wraps clipboard text in `<code>` tags  
 **Usage:**
 ```bash
-./code
+./wcode
 ```
 **Example:** `example` → `<code>example</code>`
 
@@ -256,7 +256,35 @@ pip install pillow pillow-heif
 
 ---
 
-### �🛠️ Utilities
+### 🛠️ Utilities
+
+#### `starrt` - Ruijie Captive Portal Keep-Alive
+**Functionality:** Automatically authenticates and maintains a session on Ruijie/STARlink captive portal networks using a headless browser. Periodically probes connectivity and re-authenticates if the session drops.  
+**Usage:**
+```bash
+./starrt
+```
+**Behaviour:**
+- Probes `http://neverssl.com` every 4 minutes to detect portal redirects
+- Sends heartbeat pings every 60 seconds to keep the session alive
+- Automatically checks the terms checkbox (`#wifiAccept`) and clicks the login button (`#login_btn`)
+- Re-authenticates immediately if a session drop is detected during a heartbeat
+
+**Configuration:** Edit the constants at the top of the script:
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HEADLESS` | `True` | Set `False` to watch the browser for debugging |
+| `RENEW_EVERY` | `240` | Seconds between full probe cycles |
+| `HEARTBEAT_EVERY` | `60` | Seconds between keep-alive pings |
+| `TIMEOUT_MS` | `45000` | Navigation timeout in milliseconds |
+
+**Dependencies:**
+```bash
+pip install playwright
+playwright install firefox
+```
+
+---
 
 #### `bak` - Backup to ZIP
 **Functionality:** Creates incremental ZIP backups of the current folder  
@@ -289,7 +317,7 @@ All scripts use ultra-short, intuitive names for quick typing:
 | `rnp` | Remove Newlines Preserve | Keep paragraphs |
 | `c1` | Cloze 1 | Set Anki cloze numbers |
 | `tc` | Title Case | Capitalize words |
-| `code` | Code tags | Wrap in `<code>` |
+| `wcode` | Code tags | Wrap in `<code>` |
 | `ba` | Bullet Add | Add bullet points |
 | `bc` | Bullet Compact | Clean bullet formatting |
 | `sp` | Space/Indent | Add indentation |
@@ -299,6 +327,7 @@ All scripts use ultra-short, intuitive names for quick typing:
 | `eh` | Extract Headers | Extract module titles |
 | `bak` | Backup | Create ZIP backup |
 | `mkbat` | Make Batch | Generate .bat files |
+| `starrt` | STARlink Ruijie starT | Captive portal keep-alive |
 
 **Note:** Originally planned `h+` and `h-` but changed to `hp`/`hm` to avoid shell special characters.
 

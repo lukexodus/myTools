@@ -1,0 +1,217 @@
+#!/usr/bin/python
+# starrt [STARlink Ruijie captive portal starT keep alive] 
+
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+import time
+import datetime
+
+# ────────────────────────────────────────────────
+# CONFIG
+# ────────────────────────────────────────────────
+CHECK_URL       = "http://neverssl.com"   # plain HTTP → triggers captive redirect
+USER_AGENT      = "Mozilla/5.0 (X11; Linux x86_64; rv:148.0) Gecko/20100101 Firefox/148.0"
+HEADLESS        = True     # set False to watch browser for debugging
+RENEW_EVERY     = 240      # seconds between full probe cycles
+HEARTBEAT_EVERY = 60       # seconds between keep-alive pings
+TIMEOUT_MS      = 45_000
+# ────────────────────────────────────────────────
+
+PORTAL_HOST = "portal-as.ruijienetworks.com"  # any redirect here = unauthenticated
+
+
+def log(msg):
+    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {msg}")
+
+
+# ── probe ────────────────────────────────────────────────────────────────────
+
+def probe(page) -> bool:
+    """
+    Navigate to CHECK_URL and wait for networkidle so all JS runs.
+
+    Returns True  → portal redirect detected; page is now on the portal
+                    (call do_auth() immediately — we are already there)
+    Returns False → no redirect; already connected
+
+    Observed flow when unauthenticated:
+      neverssl.com → 172.16.1.1:2060 (gateway) →
+      portal-as.ruijienetworks.com/auth/wifidogAuth/login/?gw_id=...
+        ← THIS IS the portal page (has #wifiAccept + #login_btn)
+        ← It does NOT automatically redirect further; auth happens here.
+      After clicking Connect → gateway redirects to success/internet.
+    """
+    log(f"Probing {CHECK_URL} ...")
+
+    redirected = False
+
+    def on_nav(frame):
+        nonlocal redirected
+        if frame == page.main_frame and PORTAL_HOST in frame.url:
+            redirected = True
+
+    page.on("framenavigated", on_nav)
+    try:
+        # networkidle = wait for page JS to fully settle (button enable logic, etc.)
+        page.goto(CHECK_URL, wait_until="networkidle", timeout=TIMEOUT_MS)
+    except PlaywrightTimeoutError:
+        log("Probe timed out — network may be down or page never settled")
+    except Exception as e:
+        log(f"Probe error: {e}")
+    finally:
+        page.remove_listener("framenavigated", on_nav)
+
+    if PORTAL_HOST in page.url:
+        redirected = True
+
+    if redirected:
+        log(f"Portal detected: {page.url[:90]}")
+    else:
+        log(f"Connected — no redirect. URL: {page.url[:60]}")
+
+    return redirected
+
+
+# ── auth ─────────────────────────────────────────────────────────────────────
+
+def do_auth(page):
+    """
+    The page is the portal (/auth/wifidogAuth/login/ or similar).
+    Find #wifiAccept and #login_btn, interact with them.
+    """
+    log(f"Auth on: {page.url[:90]}")
+
+    # ── find checkbox ──
+    try:
+        page.wait_for_selector("#wifiAccept", state="visible", timeout=15_000)
+    except PlaywrightTimeoutError:
+        log("ERROR: #wifiAccept not found on page — dumping visible text:")
+        log(page.inner_text("body")[:300])
+        return
+
+    try:
+        checkbox = page.locator("#wifiAccept")
+        if not checkbox.is_checked():
+            log("Checking #wifiAccept...")
+            checkbox.check(timeout=8_000)
+        else:
+            log("#wifiAccept already checked")
+    except Exception as e:
+        log(f"Checkbox error: {e}")
+        return
+
+    # ── wait for button to enable (JS does this after checkbox tick) ──
+    button = page.locator("#login_btn")
+    log("Waiting for #login_btn to enable...")
+    for _ in range(20):       # up to 10 s
+        try:
+            if not button.is_disabled():
+                break
+        except Exception:
+            pass
+        time.sleep(0.5)
+    else:
+        log("Warning: #login_btn still disabled after 10s — clicking anyway")
+
+    # ── click ──
+    log("Clicking #login_btn...")
+    try:
+        with page.expect_navigation(timeout=20_000):
+            button.click(timeout=8_000)
+        log(f"Post-click URL: {page.url[:80]}")
+    except PlaywrightTimeoutError:
+        log("No navigation after click — auth likely XHR-based (silent)")
+    except Exception as e:
+        log(f"Click error: {e}")
+
+    time.sleep(2)
+    log(f"Auth done. URL: {page.url[:80]}")
+
+
+# ── heartbeat ────────────────────────────────────────────────────────────────
+
+def heartbeat(page) -> bool:
+    """
+    Ping CHECK_URL to produce gateway-visible traffic.
+    Returns True if session expired (portal redirect detected).
+    """
+    log(f"Heartbeat → {CHECK_URL}")
+
+    redirected = False
+
+    def on_nav(frame):
+        nonlocal redirected
+        if frame == page.main_frame and PORTAL_HOST in frame.url:
+            redirected = True
+
+    page.on("framenavigated", on_nav)
+    try:
+        page.goto(CHECK_URL, wait_until="networkidle", timeout=20_000)
+    except Exception as e:
+        log(f"Heartbeat error: {e}")
+    finally:
+        page.remove_listener("framenavigated", on_nav)
+
+    if PORTAL_HOST in page.url:
+        redirected = True
+
+    if redirected:
+        log("Heartbeat: session expired — portal redirect!")
+        return True
+
+    log(f"Heartbeat: OK → {page.url[:60]}")
+    return False
+
+
+# ── main ─────────────────────────────────────────────────────────────────────
+
+def main():
+    print("Ruijie captive portal keep-alive\n")
+
+    with sync_playwright() as p:
+        browser = p.firefox.launch(
+            headless=HEADLESS,
+            slow_mo=300 if not HEADLESS else 0,
+        )
+        context = browser.new_context(
+            viewport={"width": 1280, "height": 800},
+            user_agent=USER_AGENT,
+            locale="en-US",
+            timezone_id="Asia/Manila",
+            ignore_https_errors=True,
+        )
+        page = context.new_page()
+        cycle = 0
+
+        try:
+            while True:
+                cycle += 1
+                print(f"\n{'='*60}\nCycle {cycle} — {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n{'='*60}")
+
+                needs_auth = probe(page)
+
+                if needs_auth:
+                    do_auth(page)
+
+                # Heartbeat loop until next full probe cycle
+                elapsed = 0
+                while elapsed < RENEW_EVERY:
+                    time.sleep(HEARTBEAT_EVERY)
+                    elapsed += HEARTBEAT_EVERY
+                    expired = heartbeat(page)
+                    if expired:
+                        log("Session dropped — re-authing immediately")
+                        do_auth(page)
+                        elapsed = 0  # reset — fresh session
+
+        except KeyboardInterrupt:
+            print("\nStopped (Ctrl+C)")
+        except Exception as e:
+            print(f"\nFatal: {e}")
+        finally:
+            context.close()
+            browser.close()
+            print("Cleaned up.")
+
+
+if __name__ == "__main__":
+    main()
