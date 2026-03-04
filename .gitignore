@@ -6,3 +6,7 @@ venv
 *.txt
 
 updtdns.py
+
+docs/
+
+*.starrt_state.json

@@ -1,44 +1,53 @@
 #!/usr/bin/python
-# starrt [STARlink Ruijie captive portal starT keep alive] 
-
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 import time
 import datetime
+import re
+import json
+import os
+import urllib.request
 
 # ────────────────────────────────────────────────
 # CONFIG
 # ────────────────────────────────────────────────
-CHECK_URL       = "http://neverssl.com"   # plain HTTP → triggers captive redirect
-USER_AGENT      = "Mozilla/5.0 (X11; Linux x86_64; rv:148.0) Gecko/20100101 Firefox/148.0"
-HEADLESS        = True     # set False to watch browser for debugging
-RENEW_EVERY     = 240      # seconds between full probe cycles
-HEARTBEAT_EVERY = 60       # seconds between keep-alive pings
-TIMEOUT_MS      = 45_000
+CHECK_URL        = "http://neverssl.com"
+USER_AGENT       = "Mozilla/5.0 (X11; Linux x86_64; rv:148.0) Gecko/20100101 Firefox/148.0"
+HEADLESS         = True
+HEARTBEAT_COARSE = 60      # interval (s) during safe window — just keep-alive pings
+HEARTBEAT_FINE   = 5       # interval (s) in danger zone — fast re-auth detection
+DANGER_WINDOW    = 60      # switch to fine heartbeat this many seconds before RENEW_EVERY
+RENEW_EVERY      = 240     # full probe cycle interval — dynamically adjusted
+TIMEOUT_MS       = 45_000
+
+RENEW_MIN              = 60    # never probe more often than this
+RENEW_MARGIN           = 0.8   # probe at 80% of avg session lifetime
+ADAPT_THRESHOLD        = 3     # update RENEW_EVERY after this many new data points
+STARTUP_RENEW_DEFAULT  = 195   # 3m15s — first-cycle RENEW_EVERY (time may have elapsed since last run)
+STATE_FILE = os.path.join(os.path.dirname(os.path.realpath(__file__)), ".starrt_state.json")
 # ────────────────────────────────────────────────
 
-PORTAL_HOST = "portal-as.ruijienetworks.com"  # any redirect here = unauthenticated
+PORTAL_HOST = "portal-as.ruijienetworks.com"
 
 
 def log(msg):
     print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {msg}")
 
 
-# ── probe ────────────────────────────────────────────────────────────────────
+# ── probe ─────────────────────────────────────────────────────────────────────
 
 def probe(page) -> bool:
     """
-    Navigate to CHECK_URL and wait for networkidle so all JS runs.
+    Navigate to CHECK_URL with networkidle.
 
-    Returns True  → portal redirect detected; page is now on the portal
-                    (call do_auth() immediately — we are already there)
-    Returns False → no redirect; already connected
+    When unauthenticated the full redirect chain is:
+      neverssl → 172.16.1.1:2060 → /auth/wifidogAuth/login/?gw_id=...
+                                  → (JS) → index.html?timestamp=...&sessionId=...
 
-    Observed flow when unauthenticated:
-      neverssl.com → 172.16.1.1:2060 (gateway) →
-      portal-as.ruijienetworks.com/auth/wifidogAuth/login/?gw_id=...
-        ← THIS IS the portal page (has #wifiAccept + #login_btn)
-        ← It does NOT automatically redirect further; auth happens here.
-      After clicking Connect → gateway redirects to success/internet.
+    networkidle lets the JS-driven redirect fully settle so we land on
+    index.html?sessionId=... which is the actual portal page.
+
+    Returns True if we landed on the portal (need auth).
+    Returns False if neverssl loaded normally (already connected).
     """
     log(f"Probing {CHECK_URL} ...")
 
@@ -51,10 +60,9 @@ def probe(page) -> bool:
 
     page.on("framenavigated", on_nav)
     try:
-        # networkidle = wait for page JS to fully settle (button enable logic, etc.)
         page.goto(CHECK_URL, wait_until="networkidle", timeout=TIMEOUT_MS)
     except PlaywrightTimeoutError:
-        log("Probe timed out — network may be down or page never settled")
+        log("Probe networkidle timed out — checking URL anyway")
     except Exception as e:
         log(f"Probe error: {e}")
     finally:
@@ -64,75 +72,261 @@ def probe(page) -> bool:
         redirected = True
 
     if redirected:
-        log(f"Portal detected: {page.url[:90]}")
+        log(f"Portal: {page.url[:90]}")
     else:
-        log(f"Connected — no redirect. URL: {page.url[:60]}")
+        log(f"Connected. URL: {page.url[:60]}")
 
     return redirected
 
 
-# ── auth ─────────────────────────────────────────────────────────────────────
+# ── auth interval tracking + dynamic heartbeat ───────────────────────────────
+_auth_times: list[float] = []
+_adapt_counter = 0
+_startup_renew: float = STARTUP_RENEW_DEFAULT   # restored from state; updated on early expiry
+
+
+def _load_state():
+    """Restore saved average and startup_renew from previous run."""
+    global RENEW_EVERY, _startup_renew
+    try:
+        with open(STATE_FILE) as f:
+            data = json.load(f)
+        saved_avg = float(data.get("avg_interval", 0))
+        if saved_avg > 0:
+            new_renew = max(RENEW_MIN, saved_avg * RENEW_MARGIN)
+            RENEW_EVERY = new_renew
+            log(f"[state] Restored avg session lifetime: {saved_avg:.0f}s "
+                f"-> RENEW_EVERY set to {new_renew:.0f}s (heartbeat: coarse={HEARTBEAT_COARSE}s / fine={HEARTBEAT_FINE}s)")
+        saved_startup = float(data.get("startup_renew", 0))
+        if saved_startup > 0:
+            _startup_renew = saved_startup
+            log(f"[state] Restored startup_renew: {_startup_renew:.0f}s")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log(f"[state] Could not load state: {e}")
+
+
+def _save_state(avg: float):
+    """Persist running average and startup_renew."""
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump({
+                "avg_interval":  round(avg, 1),
+                "startup_renew": round(_startup_renew, 1),
+                "updated":       datetime.datetime.now().isoformat(),
+            }, f)
+    except Exception as e:
+        log(f"[state] Could not save state: {e}")
+
+
+def _record_auth():
+    """Called after each fully completed auth. Logs interval stats and adapts RENEW_EVERY."""
+    global RENEW_EVERY, _adapt_counter
+    now = time.time()
+    _auth_times.append(now)
+    n = len(_auth_times)
+    if n < 2:
+        return  # first auth, no interval yet
+
+    interval = now - _auth_times[-2]
+    avg = (_auth_times[-1] - _auth_times[0]) / (n - 1)
+    next_auth = datetime.datetime.fromtimestamp(now + avg).strftime("%H:%M:%S")
+    log(
+        f"  Auth #{n} | interval since last: {interval:.0f}s "
+        f"| running avg: {avg:.0f}s "
+        f"(across {n-1} gap{'s' if n > 2 else ''}) "
+        f"| next auth ~{next_auth}"
+    )
+
+    _adapt_counter += 1
+    if _adapt_counter >= ADAPT_THRESHOLD:
+        _adapt_counter = 0
+        new_renew = max(RENEW_MIN, avg * RENEW_MARGIN)
+        if abs(new_renew - RENEW_EVERY) >= 5:
+            log(f"  Adapting RENEW_EVERY: {RENEW_EVERY:.0f}s -> {new_renew:.0f}s "
+                f"(avg {avg:.0f}s x {RENEW_MARGIN}, heartbeat: coarse={HEARTBEAT_COARSE}s / fine={HEARTBEAT_FINE}s)")
+            RENEW_EVERY = new_renew
+        _save_state(avg)
+
+
+
+def _try_fresh_auth(page, retries: int = 2) -> bool:
+    """
+    Open a fresh browser page (same context, zero TCP connection pool) and
+    navigate to CHECK_URL to force the gateway redirect chain.
+
+    Retries up to `retries` times because on the first attempt the browser
+    context cookies may cause the portal to auto-auth instantly, redirecting
+    back to neverssl before JS lands on index.html?sessionId=...
+
+    Returns True if auth succeeded and urllib confirms internet is live.
+    """
+    for attempt in range(1, retries + 1):
+        fresh = None
+        try:
+            fresh = page.context.new_page()
+            try:
+                fresh.goto(CHECK_URL, wait_until="networkidle", timeout=30_000)
+            except PlaywrightTimeoutError:
+                log(f"  [fresh#{attempt}] networkidle timed out — checking URL anyway")
+            except Exception as e:
+                log(f"  [fresh#{attempt}] navigation error: {e}")
+
+            if re.search(r'sessionId=', fresh.url, re.IGNORECASE):
+                log(f"  [fresh#{attempt}] sessionId found — authenticating...")
+                do_auth(fresh)
+                if verify_connectivity():
+                    log("  Fresh-page auth successful — internet restored")
+                    return True
+                else:
+                    log(f"  [fresh#{attempt}] auth done but verify failed")
+            else:
+                log(f"  [fresh#{attempt}] No sessionId (URL: {fresh.url[:60]})")
+        finally:
+            if fresh:
+                try:
+                    fresh.close()
+                except Exception:
+                    pass
+
+    log("  _try_fresh_auth: retries exhausted — caller will re-probe")
+    return False
+
 
 def do_auth(page):
+
     """
-    The page is the portal (/auth/wifidogAuth/login/ or similar).
-    Find #wifiAccept and #login_btn, interact with them.
+    Authenticate by calling the portal API directly — no UI interaction needed.
+
+    Confirmed auth flow (from network inspection):
+      1. POST https://portal-as.ruijienetworks.com/api/auth/general
+         body: {"lang":"en_US","authType":"pass","sessionId":"<ID>"}
+         → response: {"logonUrl":"http://172.16.1.1:2060/wifidog/auth?token=<ID>&phoneNumber=<MAC>"}
+      2. GET logonUrl → 302 → gateway authorizes MAC → internet live
+
+      The sessionId is embedded in the page URL:
+        .../index.html?timestamp<TS>&sessionId=<32-hex-chars>
     """
     log(f"Auth on: {page.url[:90]}")
 
-    # ── find checkbox ──
-    try:
-        page.wait_for_selector("#wifiAccept", state="visible", timeout=15_000)
-    except PlaywrightTimeoutError:
-        log("ERROR: #wifiAccept not found on page — dumping visible text:")
-        log(page.inner_text("body")[:300])
+    # ── Extract sessionId from URL ──
+    m = re.search(r'sessionId=([a-f0-9]{32,})', page.url, re.IGNORECASE)
+    if not m:
+        log("  No sessionId in URL — cannot auth directly.")
+        log(f"  URL: {page.url}")
+        return
+    session_id = m.group(1)
+    log(f"  sessionId: {session_id[:8]}...{session_id[-4:]}")
+
+    # ── POST /api/auth/general via same-origin fetch in the page context ──
+    log("  Calling /api/auth/general ...")
+    result = page.evaluate(f"""
+        async () => {{
+            try {{
+                const resp = await fetch('/api/auth/general', {{
+                    method: 'POST',
+                    headers: {{
+                        'Content-Type': 'application/json',
+                        'X-Requested-With': 'XMLHttpRequest',
+                        'Accept': '*/*'
+                    }},
+                    body: JSON.stringify({{
+                        lang: 'en_US',
+                        authType: 'pass',
+                        sessionId: '{session_id}'
+                    }})
+                }});
+                const data = await resp.json();
+                return {{ ok: true, data: data }};
+            }} catch(e) {{
+                return {{ ok: false, error: e.toString() }};
+            }}
+        }}
+    """)
+
+    if not result.get("ok"):
+        log(f"  API call failed: {result.get('error')}")
         return
 
-    try:
-        checkbox = page.locator("#wifiAccept")
-        if not checkbox.is_checked():
-            log("Checking #wifiAccept...")
-            checkbox.check(timeout=8_000)
-        else:
-            log("#wifiAccept already checked")
-    except Exception as e:
-        log(f"Checkbox error: {e}")
-        return
+    data = result.get("data", {})
+    log(f"  API response: {str(data)[:200]}")
 
-    # ── wait for button to enable (JS does this after checkbox tick) ──
-    button = page.locator("#login_btn")
-    log("Waiting for #login_btn to enable...")
-    for _ in range(20):       # up to 10 s
+    logon_url = (
+        data.get("logonUrl")
+        or (data.get("data") or {}).get("logonUrl")
+        or (data.get("result") or {}).get("logonUrl")   # ← actual response path
+    )
+
+    # ── Navigate to logonUrl → tells gateway to unblock MAC ──
+    if logon_url:
+        log(f"  Following logonUrl: {logon_url}")
         try:
-            if not button.is_disabled():
-                break
-        except Exception:
-            pass
-        time.sleep(0.5)
+            page.goto(logon_url, wait_until="commit", timeout=15_000)
+            log(f"  Gateway response URL: {page.url[:80]}")
+        except PlaywrightTimeoutError:
+            log("  logonUrl timed out (gateway may still have processed the token)")
+        except Exception as e:
+            log(f"  logonUrl error: {e}")
     else:
-        log("Warning: #login_btn still disabled after 10s — clicking anyway")
+        log(f"  WARNING: No logonUrl in response — gateway not notified")
 
-    # ── click ──
-    log("Clicking #login_btn...")
-    try:
-        with page.expect_navigation(timeout=20_000):
-            button.click(timeout=8_000)
-        log(f"Post-click URL: {page.url[:80]}")
-    except PlaywrightTimeoutError:
-        log("No navigation after click — auth likely XHR-based (silent)")
-    except Exception as e:
-        log(f"Click error: {e}")
-
-    time.sleep(2)
+    time.sleep(1)
     log(f"Auth done. URL: {page.url[:80]}")
 
+    if logon_url:
+        _record_auth()
 
-# ── heartbeat ────────────────────────────────────────────────────────────────
+
+
+
+
+
+
+
+
+
+
+
+# ── verify ────────────────────────────────────────────────────────────────────
+
+def verify_connectivity() -> bool:
+    """
+    Check internet access using Python's urllib directly — NOT via the browser.
+
+    The browser's TCP connection pool reuses existing keep-alive connections to
+    neverssl.com, bypassing the gateway's MAC filter entirely. Python's urllib
+    opens a fresh OS-level socket on every call, so the gateway sees the request
+    properly and redirects to the portal if the session has expired.
+    """
+    try:
+        resp = urllib.request.urlopen(
+            urllib.request.Request(CHECK_URL, headers={"User-Agent": USER_AGENT}),
+            timeout=8
+        )
+        final_url = resp.geturl()
+        if PORTAL_HOST in final_url:
+            log(f"  Verify: BLOCKED (redirected to portal)")
+            return False
+        log(f"  Verify: CONNECTED ({final_url[:50]})")
+        return True
+    except Exception as e:
+        log(f"  Verify error: {e}")
+        return False
+
+
+# ── heartbeat ─────────────────────────────────────────────────────────────────
 
 def heartbeat(page) -> bool:
     """
-    Ping CHECK_URL to produce gateway-visible traffic.
-    Returns True if session expired (portal redirect detected).
+    Ping CHECK_URL (commit only — fast) to check if session is still live.
+
+    If portal redirect detected:
+      - Wait up to 15s for JS to land on index.html?sessionId=...
+      - Call do_auth() directly (no need to break to probe)
+      - Return False (session re-established inline)
+
+    Returns True only if re-auth failed and caller must run a full probe.
     """
     log(f"Heartbeat → {CHECK_URL}")
 
@@ -145,27 +339,47 @@ def heartbeat(page) -> bool:
 
     page.on("framenavigated", on_nav)
     try:
-        page.goto(CHECK_URL, wait_until="networkidle", timeout=20_000)
+        page.goto(CHECK_URL, wait_until="commit", timeout=15_000)
+        # neverssl 302s to a random subdomain, which the gateway may then intercept
+        # and redirect to the portal — all happening AFTER commit. A short wait
+        # with the listener still active catches this follow-up redirect chain.
+        try:
+            page.wait_for_load_state("networkidle", timeout=8_000)
+        except Exception:
+            pass  # timeout is fine — we just want any extra navigations to settle
     except Exception as e:
-        log(f"Heartbeat error: {e}")
+        log(f"  Heartbeat error: {e}")
     finally:
         page.remove_listener("framenavigated", on_nav)
 
     if PORTAL_HOST in page.url:
         redirected = True
 
-    if redirected:
-        log("Heartbeat: session expired — portal redirect!")
-        return True
+    if not redirected:
+        log(f"  Heartbeat: OK → {page.url[:60]}")
+        return False
 
-    log(f"Heartbeat: OK → {page.url[:60]}")
-    return False
+    log("  Heartbeat: session expired — portal redirect!")
+
+    # ── Open a FRESH page to get sessionId — avoids TCP connection pool reuse ──
+    log("  Attempting fresh-page re-auth...")
+    if _try_fresh_auth(page):
+        return False   # internet restored inline
+
+    # Clean the main page so probe() doesn't pick up stale framenavigated events
+    try:
+        page.goto("about:blank", wait_until="commit", timeout=5_000)
+    except Exception:
+        pass
+    return True
 
 
-# ── main ─────────────────────────────────────────────────────────────────────
+# ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    global _startup_renew
     print("Ruijie captive portal keep-alive\n")
+    _load_state()
 
     with sync_playwright() as p:
         browser = p.firefox.launch(
@@ -183,31 +397,103 @@ def main():
         cycle = 0
 
         try:
+            need_verify = False
+            first_cycle_authed = False   # True only if cycle 1's initial probe needed auth
             while True:
                 cycle += 1
                 print(f"\n{'='*60}\nCycle {cycle} — {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n{'='*60}")
 
+                # Always re-probe via neverssl to get a fresh portal URL with sessionId.
+                # The /auth/wifidogAuth/login/ intermediary page has no sessionId so
+                # auth won't work there — we need index.html?sessionId=... specifically.
                 needs_auth = probe(page)
 
                 if needs_auth:
                     do_auth(page)
+                    if cycle == 1:
+                        first_cycle_authed = True
 
-                # Heartbeat loop until next full probe cycle
-                elapsed = 0
-                while elapsed < RENEW_EVERY:
-                    time.sleep(HEARTBEAT_EVERY)
-                    elapsed += HEARTBEAT_EVERY
-                    expired = heartbeat(page)
-                    if expired:
-                        log("Session dropped — re-authing immediately")
-                        do_auth(page)
-                        elapsed = 0  # reset — fresh session
+                # Only verify connectivity if the previous heartbeat loop detected a session
+                # expiry. On a fresh start (or after a clean cycle), neverssl loading without
+                # a portal redirect is sufficient proof of connectivity.
+                if not needs_auth and need_verify:
+                    need_verify = False
+                    if not verify_connectivity():
+                        log("Probe said Connected but verify failed — trying fresh-page auth")
+                        if not _try_fresh_auth(page):
+                            # Fresh auth also failed — force a probe on the proper page
+                            needs_auth = probe(page)
+                            if needs_auth:
+                                do_auth(page)
+
+                # ── Two-phase heartbeat loop ──────────────────────────────────
+                # Cycle 1 uses startup_renew (shorter) since time may have elapsed
+                # since the program last ran. Subsequent cycles use RENEW_EVERY.
+                # Coarse: every HEARTBEAT_COARSE seconds while session is young.
+                # Fine:   every HEARTBEAT_FINE seconds once within DANGER_WINDOW.
+                # Uses wall-clock time so heartbeat execution cost is accounted for.
+                need_verify = False
+                in_danger_zone = False
+                effective_renew = _startup_renew if cycle == 1 else RENEW_EVERY
+                # Anchor to actual last auth time so elapsed is correct across probes.
+                # If probe said "Connected" (no auth this cycle), session has been alive
+                # since _auth_times[-1] — the elapsed reflects that and danger zone
+                # triggers at the right real-world moment without resetting.
+                cycle_start = _auth_times[-1] if _auth_times else time.time()
+                if cycle == 1:
+                    log(f"[startup] Using startup_renew={effective_renew:.0f}s for cycle 1 (vs RENEW_EVERY={RENEW_EVERY:.0f}s)")
+                while True:
+                    elapsed = time.time() - cycle_start
+                    if elapsed >= effective_renew:
+                        break
+                    remaining = effective_renew - elapsed
+                    if remaining <= DANGER_WINDOW:
+                        if not in_danger_zone:
+                            log(f"Entering danger zone ({remaining:.0f}s left) — heartbeat every {HEARTBEAT_FINE}s")
+                            in_danger_zone = True
+                        sleep_for = HEARTBEAT_FINE
+                    else:
+                        sleep_for = HEARTBEAT_COARSE
+
+                    time.sleep(sleep_for)
+                    auth_count_before = len(_auth_times)
+                    need_full_probe = heartbeat(page)
+                    if len(_auth_times) > auth_count_before:
+                        # Inline re-auth — anchor timer to now, back to safe zone
+                        cycle_start = time.time()
+                        in_danger_zone = False
+                        effective_renew = RENEW_EVERY
+                        log("Heartbeat re-authed inline — cycle timer reset, back to safe zone")
+                    if need_full_probe:
+                        real_elapsed = time.time() - cycle_start
+                        if (not in_danger_zone and cycle == 1
+                                and first_cycle_authed
+                                and real_elapsed < _startup_renew):
+                            old = _startup_renew
+                            _startup_renew = max(RENEW_MIN, real_elapsed)
+                            log(f"[startup] Early expiry at {real_elapsed:.0f}s — startup_renew: {old:.0f}s -> {_startup_renew:.0f}s")
+                        need_verify = True
+                        log("Inline re-auth failed — doing full re-probe")
+                        break
 
         except KeyboardInterrupt:
-            print("\nStopped (Ctrl+C)")
+            print("\nCtrl+C received — shutting down gracefully...")
         except Exception as e:
             print(f"\nFatal: {e}")
+            import traceback; traceback.print_exc()
         finally:
+            # ── flush state on any exit (Ctrl+C, crash, or normal end) ──
+            n = len(_auth_times)
+            if n >= 2:
+                avg = (_auth_times[-1] - _auth_times[0]) / (n - 1)
+                _save_state(avg)
+                uptime = _auth_times[-1] - _auth_times[0]
+                print(f"\nSession summary:")
+                print(f"  Total auths   : {n}")
+                print(f"  Uptime tracked: {uptime/60:.1f} min")
+                print(f"  Avg interval  : {avg:.0f}s  (saved to state file)")
+            elif n == 1:
+                print(f"\nOnly 1 auth recorded — not enough data to save average.")
             context.close()
             browser.close()
             print("Cleaned up.")
