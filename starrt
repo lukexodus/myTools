@@ -11,7 +11,7 @@ import urllib.request
 # CONFIG
 # ────────────────────────────────────────────────
 CHECK_URL        = "http://neverssl.com"
-USER_AGENT       = "Mozilla/5.0 (X11; Linux x86_64; rv:148.0) Gecko/20100101 Firefox/148.0"
+USER_AGENT       = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
 HEADLESS         = True
 HEARTBEAT_COARSE = 60      # interval (s) during safe window — just keep-alive pings
 HEARTBEAT_FINE   = 5       # interval (s) in danger zone — fast re-auth detection
@@ -23,6 +23,7 @@ RENEW_MIN              = 60    # never probe more often than this
 RENEW_MARGIN           = 0.8   # probe at 80% of avg session lifetime
 ADAPT_THRESHOLD        = 3     # update RENEW_EVERY after this many new data points
 STARTUP_RENEW_DEFAULT  = 195   # 3m15s — first-cycle RENEW_EVERY (time may have elapsed since last run)
+BROWSER_RESTART_CYCLES = 8     # restart Firefox every N cycles (~1h) to free accumulated memory
 STATE_FILE = os.path.join(os.path.dirname(os.path.realpath(__file__)), ".starrt_state.json")
 # ────────────────────────────────────────────────
 
@@ -125,6 +126,9 @@ def _record_auth():
     global RENEW_EVERY, _adapt_counter
     now = time.time()
     _auth_times.append(now)
+    # Keep only the last 20 timestamps — enough for accurate running average
+    if len(_auth_times) > 20:
+        _auth_times.pop(0)
     n = len(_auth_times)
     if n < 2:
         return  # first auth, no interval yet
@@ -167,7 +171,7 @@ def _try_fresh_auth(page, retries: int = 2) -> bool:
     """
     browser = page.context.browser
     ctx_kwargs = dict(
-        viewport={"width": 1280, "height": 800},
+        viewport={"width": 640, "height": 480},
         user_agent=USER_AGENT,
         locale="en-US",
         timezone_id="Asia/Manila",
@@ -177,16 +181,31 @@ def _try_fresh_auth(page, retries: int = 2) -> bool:
         fresh_ctx = None
         fresh = None
         try:
-            fresh_ctx = browser.new_context(**ctx_kwargs)
-            fresh = fresh_ctx.new_page()
+            # Setting up a new context and route can hang if the browser IPC is wedged
+            # due to an immediate network interface drop (like ENETUNREACH).
             try:
-                fresh.goto(CHECK_URL, wait_until="networkidle", timeout=30_000)
-            except PlaywrightTimeoutError:
-                log(f"  [fresh#{attempt}] networkidle timed out — checking URL anyway")
+                fresh_ctx = browser.new_context(**ctx_kwargs)
+                fresh_ctx.set_default_timeout(15_000)  # strict timeout for everything in this context
+                fresh_ctx.route("**/*.{png,jpg,jpeg,gif,svg,webp,ico,avif,mp4,webm}",
+                                lambda route: route.abort())
+                fresh = fresh_ctx.new_page()
             except Exception as e:
-                log(f"  [fresh#{attempt}] navigation error: {e}")
+                log(f"  [fresh#{attempt}] context setup failed (network bounce?): {e}")
+                continue
 
-            if re.search(r'sessionId=', fresh.url, re.IGNORECASE):
+            # Wait for commit (headers received, URL changed to neverssl or portal).
+            # Chromium often throws ERR_NETWORK_CHANGED and aborts if the network interface
+            # bounces exactly during a wait. Catching it and waiting for the URL anyway
+            # is more robust.
+            try:
+                fresh.goto(CHECK_URL, wait_until="commit", timeout=15_000)
+            except Exception as eval_e:
+                log(f"  [fresh#{attempt}] goto error (ignoring if portal loads): {eval_e}")
+
+            # Instead of networkidle (which hangs if a tracking pixel is stuck),
+            # explicitly wait for the portal URL pattern.
+            try:
+                fresh.wait_for_url(re.compile(r'sessionId=', re.IGNORECASE), timeout=15_000)
                 log(f"  [fresh#{attempt}] sessionId found — authenticating...")
                 success = do_auth(fresh)
                 if success:
@@ -197,8 +216,9 @@ def _try_fresh_auth(page, retries: int = 2) -> bool:
                     return True
                 else:
                     log(f"  [fresh#{attempt}] auth done but verify failed")
-            else:
+            except PlaywrightTimeoutError:
                 log(f"  [fresh#{attempt}] No sessionId (URL: {fresh.url[:60]})")
+
         finally:
             for obj in (fresh, fresh_ctx):
                 if obj:
@@ -417,6 +437,7 @@ def heartbeat(page, remaining: float = 0) -> bool:
     # ── Open a FRESH page to get sessionId — avoids TCP connection pool reuse ──
     log("  Attempting fresh-page re-auth...")
     if _try_fresh_auth(page):
+        _blank_page(page)   # auth was done on a separate context; free main page DOM
         return False   # internet restored inline
 
     # Clean the main page so probe() doesn't pick up stale framenavigated events
@@ -427,6 +448,67 @@ def heartbeat(page, remaining: float = 0) -> bool:
     return True
 
 
+# ── browser helpers ──────────────────────────────────────────────────────────
+
+def _blank_page(page) -> None:
+    """
+    Navigate the main page to about:blank to release the DOM, JS heap, images,
+    and layout tree from Firefox's memory. The page stays open but holds nothing.
+    Called after every successful auth since the next navigation will be a fresh
+    probe or heartbeat anyway.
+    """
+    try:
+        page.goto("about:blank", wait_until="commit", timeout=5_000)
+    except Exception:
+        pass
+
+
+def _launch_browser(p):
+    """
+    Launch chromium_headless_shell (falls back to chromium) with memory-optimized
+    settings and return (browser, context, page).
+    Called at startup and for periodic restarts to reset accumulated memory.
+
+    Key flags:
+    - chromium_headless_shell   : stripped Chromium binary without UI chrome
+    - --single-process          : renderer in same process — eliminates child processes
+    - --disable-gpu             : no GPU compositing needed for headless
+    - --disable-dev-shm-usage   : avoids /dev/shm OOM crashes
+    - --js-flags=--max-old-space-size=64 : cap V8 heap at 64MB
+    - --disk-cache-size=0       : no disk cache
+    - image route               : block images/media — not needed for auth flow
+    """
+    # chromium_headless_shell is a stripped Chromium build available in Playwright 1.46+.
+    # Falls back to full Chromium on older versions.
+    browser_type = getattr(p, 'chromium_headless_shell', p.chromium)
+    browser = browser_type.launch(
+        headless=HEADLESS,
+        args=[
+            "--disable-gpu",
+            "--disable-dev-shm-usage",
+            "--disable-extensions",
+            "--disable-component-extensions-with-background-pages",
+            "--disable-background-networking",
+            "--disable-default-apps",
+            "--no-first-run",
+            "--disk-cache-size=0",
+            "--media-cache-size=0",
+            "--js-flags=--max-old-space-size=64",
+        ]
+    )
+    context = browser.new_context(
+        viewport={"width": 640, "height": 480},
+        user_agent=USER_AGENT,
+        locale="en-US",
+        timezone_id="Asia/Manila",
+        ignore_https_errors=True,
+    )
+    # Block images and media globally — not needed for the auth flow
+    context.route("**/*.{png,jpg,jpeg,gif,svg,webp,ico,avif,mp4,webm}",
+                  lambda route: route.abort())
+    return browser, context, context.new_page()
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -435,18 +517,7 @@ def main():
     _load_state()
 
     with sync_playwright() as p:
-        browser = p.firefox.launch(
-            headless=HEADLESS,
-            slow_mo=300 if not HEADLESS else 0,
-        )
-        context = browser.new_context(
-            viewport={"width": 1280, "height": 800},
-            user_agent=USER_AGENT,
-            locale="en-US",
-            timezone_id="Asia/Manila",
-            ignore_https_errors=True,
-        )
-        page = context.new_page()
+        browser, context, page = _launch_browser(p)
         cycle = 0
 
         try:
@@ -454,6 +525,19 @@ def main():
             first_cycle_authed = False   # True only if cycle 1's initial probe needed auth
             while True:
                 cycle += 1
+
+                # Periodic browser restart — frees JS engine heap fragmentation,
+                # accumulated connection/SSL state, and other leaks GC can't reclaim.
+                if cycle > 1 and (cycle - 1) % BROWSER_RESTART_CYCLES == 0:
+                    log(f"[memory] Restarting browser (cycle {cycle}) — freeing accumulated memory...")
+                    try:
+                        context.close()
+                        browser.close()
+                    except Exception as e:
+                        log(f"[memory] Error closing browser: {e}")
+                    browser, context, page = _launch_browser(p)
+                    log("[memory] Browser relaunched — memory reset")
+
                 print(f"\n{'='*60}\nCycle {cycle} — {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n{'='*60}")
 
                 # Always re-probe via neverssl to get a fresh portal URL with sessionId.
@@ -463,6 +547,7 @@ def main():
 
                 if needs_auth:
                     do_auth(page)
+                    _blank_page(page)   # free dict.gov.ph DOM — next nav is a heartbeat anyway
                     if cycle == 1:
                         first_cycle_authed = True
 
@@ -478,6 +563,7 @@ def main():
                             needs_auth = probe(page)
                             if needs_auth:
                                 do_auth(page)
+                                _blank_page(page)
                     elif v is None:
                         log("Probe said Connected but network unreachable — waiting for network")
 
@@ -525,6 +611,7 @@ def main():
                             cycle_start = time.time()
                             in_danger_zone = False
                             effective_renew = RENEW_EVERY
+                            _blank_page(page)   # free DOM after inline re-auth
                             log("Heartbeat re-authed inline — cycle timer reset, back to safe zone")
                             continue
                         # Session still alive past prediction — stay in danger zone.
@@ -553,6 +640,7 @@ def main():
                         cycle_start = time.time()
                         in_danger_zone = False
                         effective_renew = RENEW_EVERY
+                        _blank_page(page)   # free DOM after inline re-auth
                         log("Heartbeat re-authed inline — cycle timer reset, back to safe zone")
                     if need_full_probe:
                         real_elapsed = time.time() - cycle_start
