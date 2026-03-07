@@ -175,7 +175,12 @@ def _try_fresh_auth(page, retries: int = 2) -> bool:
 
             if re.search(r'sessionId=', fresh.url, re.IGNORECASE):
                 log(f"  [fresh#{attempt}] sessionId found — authenticating...")
-                do_auth(fresh)
+                success = do_auth(fresh)
+                if success:
+                    # Gateway redirect to dict.gov.ph IS the confirmation — no verify needed
+                    log("  Fresh-page auth successful — internet restored")
+                    return True
+                # do_auth returned False (no logonUrl) — try verify as fallback
                 if verify_connectivity():
                     log("  Fresh-page auth successful — internet restored")
                     return True
@@ -276,6 +281,8 @@ def do_auth(page):
 
     if logon_url:
         _record_auth()
+        return True   # gateway confirmed via redirect — internet is live
+    return False
 
 
 
@@ -290,14 +297,20 @@ def do_auth(page):
 
 # ── verify ────────────────────────────────────────────────────────────────────
 
-def verify_connectivity() -> bool:
+def verify_connectivity():
     """
-    Check internet access using Python's urllib directly — NOT via the browser.
+    Check internet access using Python's urllib directly (not the browser).
 
-    The browser's TCP connection pool reuses existing keep-alive connections to
-    neverssl.com, bypassing the gateway's MAC filter entirely. Python's urllib
-    opens a fresh OS-level socket on every call, so the gateway sees the request
-    properly and redirects to the portal if the session has expired.
+    Returns:
+      True   — connected (neverssl loaded without portal redirect)
+      False  — portal redirect detected (session expired, re-auth needed)
+      None   — network unreachable / hard error (interface down, no route)
+                 Unknown session state — caller should WAIT, not re-auth.
+
+    Distinguishing None from False is critical: errno 101 ENETUNREACH means
+    the network interface itself has no route. Treating that as 'session expired'
+    causes infinite re-auth loops that can never succeed because the portal is
+    also unreachable.
     """
     try:
         resp = urllib.request.urlopen(
@@ -306,18 +319,26 @@ def verify_connectivity() -> bool:
         )
         final_url = resp.geturl()
         if PORTAL_HOST in final_url:
-            log(f"  Verify: BLOCKED (redirected to portal)")
+            log("  Verify: BLOCKED (redirected to portal)")
             return False
         log(f"  Verify: CONNECTED ({final_url[:50]})")
         return True
+    except urllib.error.URLError as e:
+        reason = getattr(e, 'reason', e)
+        errno_val = getattr(reason, 'errno', None)
+        if errno_val == 101:  # ENETUNREACH — no route to host, interface down
+            log(f"  Verify: UNREACHABLE (network down: {reason})")
+            return None
+        log(f"  Verify error: {e}")
+        return None   # any other hard error — also don't assume expired
     except Exception as e:
         log(f"  Verify error: {e}")
-        return False
+        return None
 
 
 # ── heartbeat ─────────────────────────────────────────────────────────────────
 
-def heartbeat(page) -> bool:
+def heartbeat(page, remaining: float = 0) -> bool:
     """
     Ping CHECK_URL (commit only — fast) to check if session is still live.
 
@@ -328,7 +349,8 @@ def heartbeat(page) -> bool:
 
     Returns True only if re-auth failed and caller must run a full probe.
     """
-    log(f"Heartbeat → {CHECK_URL}")
+    rem_m, rem_s = divmod(max(0, int(remaining)), 60)
+    log(f"Heartbeat → {CHECK_URL}  [{rem_m}m{rem_s:02d}s until predicted expiry]")
 
     redirected = False
 
@@ -337,6 +359,7 @@ def heartbeat(page) -> bool:
         if frame == page.main_frame and PORTAL_HOST in frame.url:
             redirected = True
 
+    timed_out = False
     page.on("framenavigated", on_nav)
     try:
         page.goto(CHECK_URL, wait_until="commit", timeout=15_000)
@@ -349,6 +372,7 @@ def heartbeat(page) -> bool:
             pass  # timeout is fine — we just want any extra navigations to settle
     except Exception as e:
         log(f"  Heartbeat error: {e}")
+        timed_out = True
     finally:
         page.remove_listener("framenavigated", on_nav)
 
@@ -356,8 +380,24 @@ def heartbeat(page) -> bool:
         redirected = True
 
     if not redirected:
-        log(f"  Heartbeat: OK → {page.url[:60]}")
-        return False
+        if timed_out:
+            # page.url may be stale — use urllib to determine real state
+            v = verify_connectivity()
+            if v is True:
+                log("  Heartbeat timeout but verify OK — session still live")
+                return False
+            elif v is None:
+                # Network interface is down (ENETUNREACH, timeout, etc.)
+                # Don't treat as session expired — portal is also unreachable.
+                # Just wait; the loop will retry on the next heartbeat.
+                log("  Heartbeat timeout + network down — waiting (not re-authing)")
+                return False
+            else:  # v is False — portal redirect confirmed
+                log("  Heartbeat timeout + verify: portal redirect — session expired")
+                redirected = True
+        else:
+            log(f"  Heartbeat: OK → {page.url[:60]}")
+            return False
 
     log("  Heartbeat: session expired — portal redirect!")
 
@@ -418,13 +458,15 @@ def main():
                 # a portal redirect is sufficient proof of connectivity.
                 if not needs_auth and need_verify:
                     need_verify = False
-                    if not verify_connectivity():
-                        log("Probe said Connected but verify failed — trying fresh-page auth")
+                    v = verify_connectivity()
+                    if v is False:
+                        log("Probe said Connected but verify: portal redirect — trying fresh-page auth")
                         if not _try_fresh_auth(page):
-                            # Fresh auth also failed — force a probe on the proper page
                             needs_auth = probe(page)
                             if needs_auth:
                                 do_auth(page)
+                    elif v is None:
+                        log("Probe said Connected but network unreachable — waiting for network")
 
                 # ── Two-phase heartbeat loop ──────────────────────────────────
                 # Cycle 1 uses startup_renew (shorter) since time may have elapsed
@@ -439,13 +481,39 @@ def main():
                 # If probe said "Connected" (no auth this cycle), session has been alive
                 # since _auth_times[-1] — the elapsed reflects that and danger zone
                 # triggers at the right real-world moment without resetting.
-                cycle_start = _auth_times[-1] if _auth_times else time.time()
+                if _auth_times:
+                    cycle_start = _auth_times[-1]
+                elif cycle == 1 and not needs_auth:
+                    # Startup: already connected but no auth history — session age unknown.
+                    # Enter danger zone immediately (fine heartbeats) since the session
+                    # could be near expiry. Only exit danger zone after a real auth.
+                    cycle_start = time.time() - (effective_renew - DANGER_WINDOW)
+                    in_danger_zone = True
+                    log("[startup] Already connected, session age unknown — entering danger zone immediately")
+                else:
+                    cycle_start = time.time()
                 if cycle == 1:
                     log(f"[startup] Using startup_renew={effective_renew:.0f}s for cycle 1 (vs RENEW_EVERY={RENEW_EVERY:.0f}s)")
                 while True:
                     elapsed = time.time() - cycle_start
                     if elapsed >= effective_renew:
-                        break
+                        # Past predicted expiry — try fresh auth before re-probing
+                        log(f"Predicted expiry reached ({elapsed:.0f}s) — trying fresh-page auth before re-probe")
+                        if _try_fresh_auth(page):
+                            # Session was already expired and we re-authed inline
+                            cycle_start = time.time()
+                            in_danger_zone = False
+                            effective_renew = RENEW_EVERY
+                            log("Heartbeat re-authed inline — cycle timer reset, back to safe zone")
+                            continue
+                        # Session still alive past prediction — stay in danger zone.
+                        # Position cycle_start so remaining == DANGER_WINDOW, keeping
+                        # fine heartbeats (5s) running until auth succeeds.
+                        # Only a successful auth resets to safe zone.
+                        log("Session still alive past prediction — staying in danger zone")
+                        cycle_start = time.time() - (effective_renew - DANGER_WINDOW)
+                        in_danger_zone = True
+                        continue
                     remaining = effective_renew - elapsed
                     if remaining <= DANGER_WINDOW:
                         if not in_danger_zone:
@@ -456,8 +524,9 @@ def main():
                         sleep_for = HEARTBEAT_COARSE
 
                     time.sleep(sleep_for)
+                    remaining = max(0.0, effective_renew - (time.time() - cycle_start))
                     auth_count_before = len(_auth_times)
-                    need_full_probe = heartbeat(page)
+                    need_full_probe = heartbeat(page, remaining)
                     if len(_auth_times) > auth_count_before:
                         # Inline re-auth — anchor timer to now, back to safe zone
                         cycle_start = time.time()
