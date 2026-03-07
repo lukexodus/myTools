@@ -153,19 +153,32 @@ def _record_auth():
 
 def _try_fresh_auth(page, retries: int = 2) -> bool:
     """
-    Open a fresh browser page (same context, zero TCP connection pool) and
-    navigate to CHECK_URL to force the gateway redirect chain.
+    Open a fresh browser CONTEXT (not just a new page) and navigate to
+    CHECK_URL to force the gateway redirect chain.
 
-    Retries up to `retries` times because on the first attempt the browser
-    context cookies may cause the portal to auto-auth instantly, redirecting
-    back to neverssl before JS lands on index.html?sessionId=...
+    Why a new CONTEXT and not just a new page in the same context?
+    Pages within the same context share HTTP/2 TCP connections via connection
+    coalescing. A "fresh" page can still reuse the existing socket to
+    neverssl.com, bypass the gateway entirely, and land on neverssl.com without
+    a portal redirect. A new context has a fully isolated network stack — own
+    connection pool, own cookies — so the gateway sees a brand-new first request.
 
-    Returns True if auth succeeded and urllib confirms internet is live.
+    Returns True if auth succeeded (gateway confirmed via dict.gov.ph redirect).
     """
+    browser = page.context.browser
+    ctx_kwargs = dict(
+        viewport={"width": 1280, "height": 800},
+        user_agent=USER_AGENT,
+        locale="en-US",
+        timezone_id="Asia/Manila",
+        ignore_https_errors=True,
+    )
     for attempt in range(1, retries + 1):
+        fresh_ctx = None
         fresh = None
         try:
-            fresh = page.context.new_page()
+            fresh_ctx = browser.new_context(**ctx_kwargs)
+            fresh = fresh_ctx.new_page()
             try:
                 fresh.goto(CHECK_URL, wait_until="networkidle", timeout=30_000)
             except PlaywrightTimeoutError:
@@ -177,10 +190,8 @@ def _try_fresh_auth(page, retries: int = 2) -> bool:
                 log(f"  [fresh#{attempt}] sessionId found — authenticating...")
                 success = do_auth(fresh)
                 if success:
-                    # Gateway redirect to dict.gov.ph IS the confirmation — no verify needed
                     log("  Fresh-page auth successful — internet restored")
                     return True
-                # do_auth returned False (no logonUrl) — try verify as fallback
                 if verify_connectivity():
                     log("  Fresh-page auth successful — internet restored")
                     return True
@@ -189,14 +200,16 @@ def _try_fresh_auth(page, retries: int = 2) -> bool:
             else:
                 log(f"  [fresh#{attempt}] No sessionId (URL: {fresh.url[:60]})")
         finally:
-            if fresh:
-                try:
-                    fresh.close()
-                except Exception:
-                    pass
+            for obj in (fresh, fresh_ctx):
+                if obj:
+                    try:
+                        obj.close()
+                    except Exception:
+                        pass
 
     log("  _try_fresh_auth: retries exhausted — caller will re-probe")
     return False
+
 
 
 def do_auth(page):
