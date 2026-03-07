@@ -510,7 +510,15 @@ def main():
                 while True:
                     elapsed = time.time() - cycle_start
                     if elapsed >= effective_renew:
-                        # Past predicted expiry — try fresh auth before re-probing
+                        # Past predicted expiry — check network before wasting time on fresh auth
+                        v = verify_connectivity()
+                        if v is None:
+                            # Network is down — skip fresh auth (would just timeout on about:blank).
+                            # Stay in danger zone; network will come back.
+                            log(f"Predicted expiry reached ({elapsed:.0f}s) but network down — waiting in danger zone")
+                            cycle_start = time.time() - (effective_renew - DANGER_WINDOW)
+                            in_danger_zone = True
+                            continue
                         log(f"Predicted expiry reached ({elapsed:.0f}s) — trying fresh-page auth before re-probe")
                         if _try_fresh_auth(page):
                             # Session was already expired and we re-authed inline
