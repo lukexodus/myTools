@@ -3,19 +3,13 @@
 # Usage: python3  save <keyword> - Saves clipboard to keyword.
 #        python3  <keyword> - Loads keyword to clipboard.
 #        python3  list - Loads all keywords to clipboard.
+#        python3  replace - Replaces all data from clipboard JSON.
 #        python3  delete <keyword> - Deletes keyword.
 #        python3  delete all - Deletes all keywords.
-# Windows usage: py.exe  save <keyword> - Saves clipboard to keyword.
-#                py.exe  <keyword> - Loads keyword to clipboard.
-#                py.exe  list - Loads all keywords to clipboard.
-#                py.exe  delete <keyword> - Deletes keyword.
-#                py.exe  delete all - Deletes all keywords.
 
-import shelve, sys, subprocess, json
+import shelve, sys, subprocess, json, os
 # import shelve, pyperclip, sys  # Windows/pyperclip version
-import os
-mcb_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mcb_data')
-mcbShelf = shelve.open(mcb_path)
+mcbShelf = shelve.open(os.path.expanduser('~/mcb_data'))
 
 # wl-clipboard helper functions for Linux/Wayland
 def clipboard_copy(text):
@@ -29,35 +23,77 @@ def clipboard_paste():
     return result.stdout.decode('utf-8')
     # return pyperclip.paste()  # Windows/pyperclip version
 
+def fix_json_control_chars(s):
+    """Escape literal control characters inside JSON strings.
+    Fixes JSON copied from terminal output where \\n etc. are rendered as real newlines."""
+    result = []
+    in_string = False
+    escaped = False
+    for ch in s:
+        if escaped:
+            result.append(ch)
+            escaped = False
+        elif ch == '\\' and in_string:
+            result.append(ch)
+            escaped = True
+        elif ch == '"':
+            in_string = not in_string
+            result.append(ch)
+        elif in_string and ch == '\n':
+            result.append('\\n')
+        elif in_string and ch == '\r':
+            result.append('\\r')
+        elif in_string and ch == '\t':
+            result.append('\\t')
+        else:
+            result.append(ch)
+    return ''.join(result)
+
 # Save clipboard content.
 if len(sys.argv) == 3 and sys.argv[1].lower() == 'save':
     mcbShelf[sys.argv[2]] = clipboard_paste()
 elif len(sys.argv) == 3 and sys.argv[1].lower() == 'delete' and sys.argv[2].lower() != 'all':
     del mcbShelf[sys.argv[2]]
 elif len(sys.argv) == 3 and sys.argv[1].lower() == 'delete' and sys.argv[2].lower() == 'all':
-    for keyword in mcbShelf.keys():
+    for keyword in list(mcbShelf.keys()):
         del mcbShelf[keyword]
 elif len(sys.argv) == 2:
-    # TODO: List keywords and load content.
     if sys.argv[1].lower() == 'list':
         content = json.dumps(dict(mcbShelf.items()), indent=4)
         print(content)
         clipboard_copy(content)
+    elif sys.argv[1].lower() == 'replace':
+        try:
+            content = clipboard_paste()
+            # Try parsing directly; if it fails due to unescaped control chars
+            # (e.g. copied from terminal instead of clipboard), auto-fix and retry.
+            try:
+                new_data = json.loads(content)
+            except json.JSONDecodeError:
+                new_data = json.loads(fix_json_control_chars(content))
+            if not isinstance(new_data, dict):
+                print(f"Error: Clipboard content is valid JSON but not a dictionary (got {type(new_data).__name__}).")
+                sys.exit(1)
+            # Clear existing data
+            for key in list(mcbShelf.keys()):
+                del mcbShelf[key]
+            # Populate with new data
+            for key, value in new_data.items():
+                mcbShelf[str(key)] = str(value)
+            print(f"Successfully replaced mcb data with {len(new_data)} entries.")
+        except json.JSONDecodeError as e:
+            print(f"Error: Clipboard content is not valid JSON.\nJSON error: {e}")
+        except Exception as e:
+            print(f"Error during replace: {type(e).__name__}: {e}")
     elif sys.argv[1] in mcbShelf:
         clipboard_copy(mcbShelf[sys.argv[1]])
 else:
-    usage = '''# Usage: python3  save <keyword> - Saves clipboard to keyword.
-#        python3  <keyword> - Loads keyword to clipboard.
-#        python3  list - Loads all keywords to clipboard.
-#        python3  delete <keyword> - Deletes keyword.
-#        python3  delete all - Deletes all keywords.'''
-    # Windows usage:
-    # usage = \'\'\'# Usage: py.exe  save <keyword> - Saves clipboard to keyword.
-    # #        py.exe  <keyword> - Loads keyword to clipboard.
-    # #        py.exe  list - Loads all keywords to clipboard.
-    # #        py.exe  delete <keyword> - Deletes keyword.
-    # #        py.exe  delete all - Deletes all keywords.\'\'\'
+    usage = '''Usage: mcb save <keyword>  - Save clipboard to keyword.
+       mcb <keyword>       - Load keyword to clipboard.
+       mcb list            - List all keywords (copies JSON to clipboard).
+       mcb replace         - Replace all data from clipboard JSON.
+       mcb delete <keyword>- Delete keyword.
+       mcb delete all      - Delete all keywords.'''
     print(usage)
-    clipboard_copy(usage)
-    
+
 mcbShelf.close()
