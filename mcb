@@ -11,9 +11,11 @@
 #                py.exe  delete <keyword> - Deletes keyword.
 #                py.exe  delete all - Deletes all keywords.
 
-import shelve, sys, subprocess
+import shelve, sys, subprocess, json
 # import shelve, pyperclip, sys  # Windows/pyperclip version
-mcbShelf = shelve.open('mcb')
+import os
+mcb_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mcb_data')
+mcbShelf = shelve.open(mcb_path)
 
 # wl-clipboard helper functions for Linux/Wayland
 def clipboard_copy(text):
@@ -38,7 +40,9 @@ elif len(sys.argv) == 3 and sys.argv[1].lower() == 'delete' and sys.argv[2].lowe
 elif len(sys.argv) == 2:
     # TODO: List keywords and load content.
     if sys.argv[1].lower() == 'list':
-        clipboard_copy(str(dict(mcbShelf.items())))
+        content = json.dumps(dict(mcbShelf.items()), indent=4)
+        print(content)
+        clipboard_copy(content)
     elif sys.argv[1] in mcbShelf:
         clipboard_copy(mcbShelf[sys.argv[1]])
 else:
