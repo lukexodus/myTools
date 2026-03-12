@@ -10,7 +10,25 @@ import urllib.request
 # ────────────────────────────────────────────────
 # CONFIG
 # ────────────────────────────────────────────────
-CHECK_URL        = "http://neverssl.com"
+# ────────────────────────────────────────────────
+# Rotate check URLs so aggressive polling doesn't exhaust the gateway's state
+# table for a single domain (which breaks it in the user's real browser).
+CHECK_URLS = [
+    "http://neverssl.com",
+    "http://httpforever.com",
+    "http://stevemorse.org",
+    "http://example.com",
+    "http://info.cern.ch",
+    "http://bbc.com"
+]
+
+_url_idx = 0
+def get_check_url():
+    global _url_idx
+    url = CHECK_URLS[_url_idx]
+    _url_idx = (_url_idx + 1) % len(CHECK_URLS)
+    return url
+
 USER_AGENT       = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
 HEADLESS         = True
 HEARTBEAT_COARSE = 60      # interval (s) during safe window — just keep-alive pings
@@ -50,7 +68,8 @@ def probe(page) -> bool:
     Returns True if we landed on the portal (need auth).
     Returns False if neverssl loaded normally (already connected).
     """
-    log(f"Probing {CHECK_URL} ...")
+    check_url = get_check_url()
+    log(f"Probing {check_url} ...")
 
     redirected = False
 
@@ -61,7 +80,7 @@ def probe(page) -> bool:
 
     page.on("framenavigated", on_nav)
     try:
-        page.goto(CHECK_URL, wait_until="networkidle", timeout=TIMEOUT_MS)
+        page.goto(check_url, wait_until="networkidle", timeout=TIMEOUT_MS)
     except PlaywrightTimeoutError:
         log("Probe networkidle timed out — checking URL anyway")
     except Exception as e:
@@ -170,6 +189,7 @@ def _try_fresh_auth(page, retries: int = 2) -> bool:
     Returns True if auth succeeded (gateway confirmed via dict.gov.ph redirect).
     """
     browser = page.context.browser
+    check_url = get_check_url()
     ctx_kwargs = dict(
         viewport={"width": 640, "height": 480},
         user_agent=USER_AGENT,
@@ -198,7 +218,7 @@ def _try_fresh_auth(page, retries: int = 2) -> bool:
             # bounces exactly during a wait. Catching it and waiting for the URL anyway
             # is more robust.
             try:
-                fresh.goto(CHECK_URL, wait_until="commit", timeout=15_000)
+                fresh.goto(check_url, wait_until="commit", timeout=15_000)
             except Exception as eval_e:
                 log(f"  [fresh#{attempt}] goto error (ignoring if portal loads): {eval_e}")
 
@@ -346,8 +366,9 @@ def verify_connectivity():
     also unreachable.
     """
     try:
+        check_url = get_check_url()
         resp = urllib.request.urlopen(
-            urllib.request.Request(CHECK_URL, headers={"User-Agent": USER_AGENT}),
+            urllib.request.Request(check_url, headers={"User-Agent": USER_AGENT}),
             timeout=8
         )
         final_url = resp.geturl()
@@ -383,7 +404,8 @@ def heartbeat(page, remaining: float = 0) -> bool:
     Returns True only if re-auth failed and caller must run a full probe.
     """
     rem_m, rem_s = divmod(max(0, int(remaining)), 60)
-    log(f"Heartbeat → {CHECK_URL}  [{rem_m}m{rem_s:02d}s until predicted expiry]")
+    check_url = get_check_url()
+    log(f"Heartbeat → {check_url}  [{rem_m}m{rem_s:02d}s until predicted expiry]")
 
     redirected = False
 
@@ -395,7 +417,7 @@ def heartbeat(page, remaining: float = 0) -> bool:
     timed_out = False
     page.on("framenavigated", on_nav)
     try:
-        page.goto(CHECK_URL, wait_until="commit", timeout=15_000)
+        page.goto(check_url, wait_until="commit", timeout=15_000)
         # neverssl 302s to a random subdomain, which the gateway may then intercept
         # and redirect to the portal — all happening AFTER commit. A short wait
         # with the listener still active catches this follow-up redirect chain.
@@ -596,29 +618,8 @@ def main():
                 while True:
                     elapsed = time.time() - cycle_start
                     if elapsed >= effective_renew:
-                        # Past predicted expiry — check network before wasting time on fresh auth
-                        v = verify_connectivity()
-                        if v is None:
-                            # Network is down — skip fresh auth (would just timeout on about:blank).
-                            # Stay in danger zone; network will come back.
-                            log(f"Predicted expiry reached ({elapsed:.0f}s) but network down — waiting in danger zone")
-                            cycle_start = time.time() - (effective_renew - DANGER_WINDOW)
-                            in_danger_zone = True
-                            continue
-                        log(f"Predicted expiry reached ({elapsed:.0f}s) — trying fresh-page auth before re-probe")
-                        if _try_fresh_auth(page):
-                            # Session was already expired and we re-authed inline
-                            cycle_start = time.time()
-                            in_danger_zone = False
-                            effective_renew = RENEW_EVERY
-                            _blank_page(page)   # free DOM after inline re-auth
-                            log("Heartbeat re-authed inline — cycle timer reset, back to safe zone")
-                            continue
-                        # Session still alive past prediction — stay in danger zone.
-                        # Position cycle_start so remaining == DANGER_WINDOW, keeping
-                        # fine heartbeats (5s) running until auth succeeds.
-                        # Only a successful auth resets to safe zone.
-                        log("Session still alive past prediction — staying in danger zone")
+                        # Past predicted expiry
+                        log(f"Predicted expiry reached ({elapsed:.0f}s) — staying in danger zone until portal redirects")
                         cycle_start = time.time() - (effective_renew - DANGER_WINDOW)
                         in_danger_zone = True
                         continue
