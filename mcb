@@ -62,6 +62,10 @@ elif len(sys.argv) == 2:
         content = json.dumps(dict(mcbShelf.items()), indent=4)
         print(content)
         clipboard_copy(content)
+    elif sys.argv[1].lower() == 'keys':
+        content = '\n'.join(sorted(mcbShelf.keys()))
+        print(content)
+        clipboard_copy(content)
     elif sys.argv[1].lower() == 'replace':
         try:
             content = clipboard_paste()
@@ -91,6 +95,7 @@ else:
     usage = '''Usage: mcb save <keyword>  - Save clipboard to keyword.
        mcb <keyword>       - Load keyword to clipboard.
        mcb list            - List all keywords (copies JSON to clipboard).
+         mcb keys            - List keyword names only (sorted, copied to clipboard).
        mcb replace         - Replace all data from clipboard JSON.
        mcb delete <keyword>- Delete keyword.
        mcb delete all      - Delete all keywords.'''

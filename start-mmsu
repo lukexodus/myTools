@@ -1,0 +1,709 @@
+#!/usr/bin/python
+"""
+starrt-mmsu — MMSU WiFi captive portal keep-alive
+==================================================
+Handles the Cisco Authentication Proxy login page at MMSU.
+Auth flow: POST /login.html  { username, password, redirect_url }
+           ← gateway unblocks MAC, internet live
+
+Heartbeat architecture mirrors starrt (Ruijie) — same coarse/fine/danger-zone
+timing model with adaptive RENEW_EVERY and periodic browser restarts.
+"""
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+import time
+import datetime
+import json
+import os
+import shutil
+import subprocess
+import urllib.request
+
+# ────────────────────────────────────────────────
+# CONFIG
+# ────────────────────────────────────────────────
+USERNAME = "23-140209"
+PASSWORD = "Tbe2CR"
+
+# Optional WiFi auto-reconnect settings (override via env vars at runtime)
+WIFI_CONNECTION_NAME   = os.getenv("MMSU_WIFI_CONNECTION", "")  # pre-saved nmcli connection
+WIFI_SSID              = os.getenv("MMSU_WIFI_SSID", "")        # direct SSID connect fallback
+WIFI_PASSWORD          = os.getenv("MMSU_WIFI_PASSWORD", "")
+WIFI_INTERFACE         = os.getenv("MMSU_WIFI_INTERFACE", "")
+WIFI_CONNECT_CMD       = os.getenv("MMSU_WIFI_CONNECT_CMD", "")  # custom shell command
+DISCONNECT_REPORT_CMD  = os.getenv("MMSU_DISCONNECT_REPORT_CMD", "")
+AUTO_WIFI_RECONNECT    = True
+
+# Rotate plain-HTTP URLs so aggressive polling doesn't exhaust gateway state
+CHECK_URLS = [
+    "http://neverssl.com",
+    "http://httpforever.com",
+    "http://example.com",
+    "http://info.cern.ch",
+    "http://stevemorse.org",
+    "http://bbc.com",
+]
+
+_url_idx = 0
+def get_check_url():
+    global _url_idx
+    url = CHECK_URLS[_url_idx]
+    _url_idx = (_url_idx + 1) % len(CHECK_URLS)
+    return url
+
+USER_AGENT       = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+HEADLESS         = True
+HEARTBEAT_COARSE = 60      # seconds — safe window sleep
+HEARTBEAT_FINE   = 5       # seconds — danger zone sleep
+DANGER_WINDOW    = 60      # switch to fine heartbeat this many seconds before RENEW_EVERY
+RENEW_EVERY      = 240     # probe cycle interval — dynamically adjusted
+TIMEOUT_MS       = 45_000
+
+RENEW_MIN              = 60
+RENEW_MARGIN           = 0.8
+ADAPT_THRESHOLD        = 3
+STARTUP_RENEW_DEFAULT  = 195   # 3m15s — shorter first cycle
+BROWSER_RESTART_CYCLES = 8
+
+# Cisco portal detection: gateway redirects to this host when session expires
+PORTAL_HOSTS = (
+    "172.16.",         # common gateway LAN prefix
+    "192.168.",
+    "10.",
+    "/login.html",
+    "login.html",
+)
+
+STATE_FILE = os.path.join(os.path.dirname(os.path.realpath(__file__)), ".starrt_mmsu_state.json")
+# ────────────────────────────────────────────────
+
+
+def log(msg):
+    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {msg}")
+
+
+def _is_portal_url(url: str) -> bool:
+    """Return True if current URL is the Cisco captive portal login page."""
+    return any(h in url for h in PORTAL_HOSTS) or "login.html" in url
+
+
+# ── state persistence ─────────────────────────────────────────────────────────
+
+_auth_times: list = []
+_adapt_counter = 0
+_startup_renew: float = STARTUP_RENEW_DEFAULT
+_connectivity_state = "unknown"
+
+
+def _load_state():
+    global RENEW_EVERY, _startup_renew
+    try:
+        with open(STATE_FILE) as f:
+            data = json.load(f)
+        saved_avg = float(data.get("avg_interval", 0))
+        if saved_avg > 0:
+            new_renew = max(RENEW_MIN, saved_avg * RENEW_MARGIN)
+            RENEW_EVERY = new_renew
+            log(f"[state] Restored avg session lifetime: {saved_avg:.0f}s "
+                f"-> RENEW_EVERY={new_renew:.0f}s")
+        saved_startup = float(data.get("startup_renew", 0))
+        if saved_startup > 0:
+            _startup_renew = saved_startup
+            log(f"[state] Restored startup_renew: {_startup_renew:.0f}s")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log(f"[state] Could not load state: {e}")
+
+
+def _save_state(avg: float):
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump({
+                "avg_interval":  round(avg, 1),
+                "startup_renew": round(_startup_renew, 1),
+                "updated":       datetime.datetime.now().isoformat(),
+            }, f)
+    except Exception as e:
+        log(f"[state] Could not save state: {e}")
+
+
+def _record_auth():
+    global RENEW_EVERY, _adapt_counter
+    now = time.time()
+    _auth_times.append(now)
+    if len(_auth_times) > 20:
+        _auth_times.pop(0)
+    n = len(_auth_times)
+    if n < 2:
+        return
+    interval = now - _auth_times[-2]
+    avg = (_auth_times[-1] - _auth_times[0]) / (n - 1)
+    next_auth = datetime.datetime.fromtimestamp(now + avg).strftime("%H:%M:%S")
+    log(
+        f"  Auth #{n} | interval since last: {interval:.0f}s "
+        f"| running avg: {avg:.0f}s "
+        f"(across {n-1} gap{'s' if n > 2 else ''}) "
+        f"| next auth ~{next_auth}"
+    )
+    _adapt_counter += 1
+    if _adapt_counter >= ADAPT_THRESHOLD:
+        _adapt_counter = 0
+        new_renew = max(RENEW_MIN, avg * RENEW_MARGIN)
+        if abs(new_renew - RENEW_EVERY) >= 5:
+            log(f"  Adapting RENEW_EVERY: {RENEW_EVERY:.0f}s -> {new_renew:.0f}s "
+                f"(avg {avg:.0f}s x {RENEW_MARGIN})")
+            RENEW_EVERY = new_renew
+        _save_state(avg)
+
+
+# ── connectivity + wifi helpers ──────────────────────────────────────────────
+
+def _format_cmd(cmd_parts):
+    redacted = []
+    for token in cmd_parts:
+        token_str = str(token)
+        if WIFI_PASSWORD and token_str == WIFI_PASSWORD:
+            redacted.append("***")
+        else:
+            redacted.append(token_str)
+    return " ".join(redacted)
+
+
+def _run_nmcli(cmd, desc):
+    try:
+        log(f"[wifi] {desc}: {_format_cmd(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if result.stdout.strip():
+            log(f"[wifi] stdout: {result.stdout.strip()}")
+        if result.stderr.strip():
+            log(f"[wifi] stderr: {result.stderr.strip()}")
+        if result.returncode == 0:
+            return True
+        log(f"[wifi] nmcli exited with {result.returncode}")
+    except FileNotFoundError:
+        log("[wifi] nmcli not found — install NetworkManager CLI to enable auto-connect")
+    except Exception as e:
+        log(f"[wifi] nmcli error: {e}")
+    return False
+
+
+def _run_shell_command(command: str, context: str) -> bool:
+    try:
+        log(f"[{context}] executing: {command}")
+        result = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.stdout.strip():
+            log(f"[{context}] stdout: {result.stdout.strip()}")
+        if result.stderr.strip():
+            log(f"[{context}] stderr: {result.stderr.strip()}")
+        if result.returncode == 0:
+            return True
+        log(f"[{context}] exited with {result.returncode}")
+    except Exception as e:
+        log(f"[{context}] error: {e}")
+    return False
+
+
+def _connect_wifi() -> bool:
+    if not AUTO_WIFI_RECONNECT:
+        return False
+    if WIFI_CONNECT_CMD:
+        return _run_shell_command(WIFI_CONNECT_CMD, "wifi-custom")
+    if shutil.which("nmcli") is None:
+        log("[wifi] nmcli not available — cannot auto-connect")
+        return False
+    if WIFI_CONNECTION_NAME:
+        cmd = ["nmcli", "connection", "up", WIFI_CONNECTION_NAME]
+        if WIFI_INTERFACE:
+            cmd += ["ifname", WIFI_INTERFACE]
+        return _run_nmcli(cmd, "connection up")
+    if WIFI_SSID:
+        cmd = ["nmcli", "dev", "wifi", "connect", WIFI_SSID]
+        if WIFI_PASSWORD:
+            cmd += ["password", WIFI_PASSWORD]
+        if WIFI_INTERFACE:
+            cmd += ["ifname", WIFI_INTERFACE]
+        return _run_nmcli(cmd, "wifi connect")
+    log("[wifi] AUTO_WIFI_RECONNECT enabled but no WIFI_CONNECTION_NAME or WIFI_SSID provided")
+    return False
+
+
+def _report_disconnect(detail: str, attempt_wifi: bool = False) -> None:
+    log(f"[disconnect] {detail}")
+    if DISCONNECT_REPORT_CMD:
+        _run_shell_command(DISCONNECT_REPORT_CMD, "disconnect-report")
+    if attempt_wifi:
+        _connect_wifi()
+
+
+def _update_connectivity_state(state: str, detail: str = "", attempt_wifi: bool = False) -> None:
+    global _connectivity_state
+    previous = _connectivity_state
+    if state == previous:
+        return
+    _connectivity_state = state
+    if state == "online":
+        if previous not in ("online", "unknown"):
+            log("[disconnect] Connectivity restored")
+        return
+    reason = detail or f"Connectivity state -> {state}"
+    _report_disconnect(reason, attempt_wifi=attempt_wifi)
+
+
+# ── probe ─────────────────────────────────────────────────────────────────────
+
+def probe(page) -> bool:
+    """
+    Navigate to a plain-HTTP URL. The Cisco gateway intercepts and redirects
+    unauthenticated clients to the login page (/login.html).
+
+    Returns True  → portal detected, auth needed.
+    Returns False → loaded normally, already connected.
+    """
+    check_url = get_check_url()
+    log(f"Probing {check_url} ...")
+
+    redirected = False
+
+    def on_nav(frame):
+        nonlocal redirected
+        if frame == page.main_frame and _is_portal_url(frame.url):
+            redirected = True
+
+    page.on("framenavigated", on_nav)
+    try:
+        page.goto(check_url, wait_until="networkidle", timeout=TIMEOUT_MS)
+    except PlaywrightTimeoutError:
+        log("Probe networkidle timed out — checking URL anyway")
+    except Exception as e:
+        log(f"Probe error: {e}")
+    finally:
+        page.remove_listener("framenavigated", on_nav)
+
+    if _is_portal_url(page.url):
+        redirected = True
+
+    if redirected:
+        log(f"Portal detected: {page.url[:90]}")
+        _update_connectivity_state("portal", "Probe detected captive portal", attempt_wifi=False)
+    else:
+        log(f"Connected. URL: {page.url[:60]}")
+        _update_connectivity_state("online")
+    return redirected
+
+
+# ── auth ──────────────────────────────────────────────────────────────────────
+
+def do_auth(page) -> bool:
+    """
+    Submit the Cisco captive portal login form.
+
+    Flow:
+      1. Ensure we are on the login page (or navigate there).
+      2. Fill username + password fields.
+      3. Submit — gateway POSTs to /login.html and redirects the MAC.
+      4. Wait for the post-login page to load.
+
+    Returns True on apparent success, False on failure.
+    """
+    log(f"Auth on: {page.url[:90]}")
+
+    # If the page doesn't look like the portal, navigate directly
+    if not _is_portal_url(page.url):
+        log("  Not on login page — navigating to trigger redirect...")
+        try:
+            page.goto(get_check_url(), wait_until="networkidle", timeout=TIMEOUT_MS)
+        except Exception as e:
+            log(f"  Navigation error: {e}")
+
+    # Wait for the login form to appear
+    try:
+        page.wait_for_selector('input[name="username"]', timeout=15_000)
+    except PlaywrightTimeoutError:
+        log(f"  Login form not found on {page.url[:70]} — cannot auth")
+        return False
+
+    log(f"  Filling credentials for {USERNAME} ...")
+    try:
+        page.fill('input[name="username"]', USERNAME)
+        page.fill('input[name="password"]', PASSWORD)
+    except Exception as e:
+        log(f"  Error filling form: {e}")
+        return False
+
+    # Click Submit (the onclick calls submitAction() which does form.submit())
+    try:
+        page.click('input[type="submit"]', timeout=10_000)
+    except Exception as e:
+        log(f"  Error clicking submit: {e}")
+        return False
+
+    # Wait for gateway response (either a success page or a redirect)
+    try:
+        page.wait_for_load_state("networkidle", timeout=20_000)
+    except PlaywrightTimeoutError:
+        log("  Post-auth networkidle timed out — checking connectivity anyway")
+    except Exception as e:
+        log(f"  Post-auth wait error: {e}")
+
+    log(f"  Post-auth URL: {page.url[:80]}")
+
+    # Quick connectivity check to confirm the gateway unblocked us
+    if verify_connectivity() is True:
+        log("  Auth successful — internet confirmed")
+        _record_auth()
+        return True
+
+    # Sometimes the response is immediate without a full page load
+    # If we are no longer on the login page, assume success
+    if not _is_portal_url(page.url):
+        log("  Auth appears successful (no longer on portal)")
+        _record_auth()
+        _update_connectivity_state("online")
+        return True
+
+    log("  Auth may have failed — still on portal page")
+    _update_connectivity_state("portal", "Auth finished but portal still visible", attempt_wifi=False)
+    return False
+
+
+def _try_fresh_auth(page, retries: int = 2) -> bool:
+    """
+    Open a fresh browser context (isolated network stack) to get a clean
+    gateway redirect, then authenticate. Returns True on success.
+    """
+    browser = page.context.browser
+    ctx_kwargs = dict(
+        viewport={"width": 640, "height": 480},
+        user_agent=USER_AGENT,
+        locale="en-US",
+        timezone_id="Asia/Manila",
+        ignore_https_errors=True,
+    )
+    for attempt in range(1, retries + 1):
+        fresh_ctx = None
+        fresh = None
+        try:
+            try:
+                fresh_ctx = browser.new_context(**ctx_kwargs)
+                fresh_ctx.set_default_timeout(20_000)
+                fresh_ctx.route("**/*.{png,jpg,jpeg,gif,svg,webp,ico,avif,mp4,webm}",
+                                lambda route: route.abort())
+                fresh = fresh_ctx.new_page()
+            except Exception as e:
+                log(f"  [fresh#{attempt}] context setup failed: {e}")
+                continue
+
+            check_url = get_check_url()
+            try:
+                fresh.goto(check_url, wait_until="commit", timeout=15_000)
+            except Exception as e:
+                log(f"  [fresh#{attempt}] goto error (continuing): {e}")
+
+            # Wait for the login form to appear
+            try:
+                fresh.wait_for_selector('input[name="username"]', timeout=15_000)
+                log(f"  [fresh#{attempt}] Login form found — authenticating...")
+                success = do_auth(fresh)
+                if success:
+                    log("  Fresh-page auth successful — internet restored")
+                    return True
+            except PlaywrightTimeoutError:
+                log(f"  [fresh#{attempt}] Login form not found (URL: {fresh.url[:60]})")
+
+        finally:
+            for obj in (fresh, fresh_ctx):
+                if obj:
+                    try:
+                        obj.close()
+                    except Exception:
+                        pass
+
+    log("  _try_fresh_auth: retries exhausted")
+    return False
+
+
+# ── verify connectivity ───────────────────────────────────────────────────────
+
+def verify_connectivity():
+    """
+    Check internet access via urllib (bypasses browser TCP pool).
+
+    Returns:
+      True  — connected
+      False — portal redirect detected (session expired)
+      None  — hard network error (interface down / unreachable)
+    """
+    try:
+        check_url = get_check_url()
+        resp = urllib.request.urlopen(
+            urllib.request.Request(check_url, headers={"User-Agent": USER_AGENT}),
+            timeout=8
+        )
+        final_url = resp.geturl()
+        if _is_portal_url(final_url):
+            log("  Verify: BLOCKED (redirected to portal)")
+            _update_connectivity_state("portal", "Verify detected captive portal", attempt_wifi=False)
+            return False
+        log(f"  Verify: CONNECTED ({final_url[:50]})")
+        _update_connectivity_state("online")
+        return True
+    except urllib.error.URLError as e:
+        reason = getattr(e, "reason", e)
+        errno_val = getattr(reason, "errno", None)
+        if errno_val == 101:
+            log(f"  Verify: UNREACHABLE (network down: {reason})")
+            _update_connectivity_state("network_down", f"Network unreachable: {reason}", attempt_wifi=True)
+            return None
+        log(f"  Verify error: {e}")
+        _update_connectivity_state("network_error", f"Verify error: {e}", attempt_wifi=False)
+        return None
+    except Exception as e:
+        log(f"  Verify error: {e}")
+        _update_connectivity_state("network_error", f"Verify exception: {e}", attempt_wifi=False)
+        return None
+
+
+# ── heartbeat ─────────────────────────────────────────────────────────────────
+
+def heartbeat(page, remaining: float = 0) -> bool:
+    """
+    Fast connectivity ping. If the portal redirect is detected, attempt inline
+    re-auth via a fresh context.
+
+    Returns True  → inline auth failed, caller must run full probe.
+    Returns False → session still live (or re-auth succeeded inline).
+    """
+    rem_m, rem_s = divmod(max(0, int(remaining)), 60)
+    check_url = get_check_url()
+    log(f"Heartbeat → {check_url}  [{rem_m}m{rem_s:02d}s until predicted expiry]")
+
+    redirected = False
+
+    def on_nav(frame):
+        nonlocal redirected
+        if frame == page.main_frame and _is_portal_url(frame.url):
+            redirected = True
+
+    timed_out = False
+    page.on("framenavigated", on_nav)
+    try:
+        page.goto(check_url, wait_until="commit", timeout=15_000)
+        try:
+            page.wait_for_load_state("networkidle", timeout=8_000)
+        except Exception:
+            pass
+    except Exception as e:
+        log(f"  Heartbeat error: {e}")
+        timed_out = True
+    finally:
+        page.remove_listener("framenavigated", on_nav)
+
+    if _is_portal_url(page.url):
+        redirected = True
+
+    if not redirected:
+        if timed_out:
+            v = verify_connectivity()
+            if v is True:
+                log("  Heartbeat timeout but verify OK — session still live")
+                return False
+            elif v is None:
+                log("  Heartbeat timeout + network down — waiting (not re-authing)")
+                return False
+            else:
+                log("  Heartbeat timeout + verify: portal redirect — session expired")
+                redirected = True
+        else:
+            log(f"  Heartbeat: OK → {page.url[:60]}")
+            _update_connectivity_state("online")
+            return False
+
+    log("  Heartbeat: session expired — portal redirect!")
+    _update_connectivity_state("portal", "Heartbeat detected captive portal", attempt_wifi=False)
+    log("  Attempting fresh-page re-auth...")
+    if _try_fresh_auth(page):
+        _blank_page(page)
+        return False
+
+    try:
+        page.goto("about:blank", wait_until="commit", timeout=5_000)
+    except Exception:
+        pass
+    return True
+
+
+# ── browser helpers ───────────────────────────────────────────────────────────
+
+def _blank_page(page) -> None:
+    try:
+        page.goto("about:blank", wait_until="commit", timeout=5_000)
+    except Exception:
+        pass
+
+
+def _launch_browser(p):
+    browser_type = getattr(p, "chromium_headless_shell", p.chromium)
+    browser = browser_type.launch(
+        headless=HEADLESS,
+        args=[
+            "--disable-gpu",
+            "--disable-dev-shm-usage",
+            "--disable-extensions",
+            "--disable-component-extensions-with-background-pages",
+            "--disable-background-networking",
+            "--disable-default-apps",
+            "--no-first-run",
+            "--disk-cache-size=0",
+            "--media-cache-size=0",
+            "--js-flags=--max-old-space-size=64",
+        ]
+    )
+    context = browser.new_context(
+        viewport={"width": 640, "height": 480},
+        user_agent=USER_AGENT,
+        locale="en-US",
+        timezone_id="Asia/Manila",
+        ignore_https_errors=True,
+    )
+    context.route("**/*.{png,jpg,jpeg,gif,svg,webp,ico,avif,mp4,webm}",
+                  lambda route: route.abort())
+    return browser, context, context.new_page()
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    global _startup_renew
+    print("MMSU WiFi captive portal keep-alive\n")
+    print(f"  Username : {USERNAME}")
+    print(f"  Heartbeat: coarse={HEARTBEAT_COARSE}s / fine={HEARTBEAT_FINE}s / danger={DANGER_WINDOW}s\n")
+    _load_state()
+
+    with sync_playwright() as p:
+        browser, context, page = _launch_browser(p)
+        cycle = 0
+
+        try:
+            need_verify = False
+            first_cycle_authed = False
+            while True:
+                cycle += 1
+
+                if cycle > 1 and (cycle - 1) % BROWSER_RESTART_CYCLES == 0:
+                    log(f"[memory] Restarting browser (cycle {cycle})...")
+                    try:
+                        context.close()
+                        browser.close()
+                    except Exception as e:
+                        log(f"[memory] Error closing browser: {e}")
+                    browser, context, page = _launch_browser(p)
+                    log("[memory] Browser relaunched — memory reset")
+
+                print(f"\n{'='*60}\nCycle {cycle} — {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n{'='*60}")
+
+                needs_auth = probe(page)
+
+                if needs_auth:
+                    do_auth(page)
+                    _blank_page(page)
+                    if cycle == 1:
+                        first_cycle_authed = True
+
+                if not needs_auth and need_verify:
+                    need_verify = False
+                    v = verify_connectivity()
+                    if v is False:
+                        log("Probe said Connected but verify: portal redirect — trying fresh-page auth")
+                        if not _try_fresh_auth(page):
+                            needs_auth = probe(page)
+                            if needs_auth:
+                                do_auth(page)
+                                _blank_page(page)
+                    elif v is None:
+                        log("Probe said Connected but network unreachable — waiting")
+
+                # ── Two-phase heartbeat loop ──────────────────────────────────
+                need_verify = False
+                in_danger_zone = False
+                effective_renew = _startup_renew if cycle == 1 else RENEW_EVERY
+
+                if _auth_times:
+                    cycle_start = _auth_times[-1]
+                elif cycle == 1 and not needs_auth:
+                    cycle_start = time.time() - (effective_renew - DANGER_WINDOW)
+                    in_danger_zone = True
+                    log("[startup] Already connected, session age unknown — entering danger zone immediately")
+                else:
+                    cycle_start = time.time()
+
+                if cycle == 1:
+                    log(f"[startup] Using startup_renew={effective_renew:.0f}s for cycle 1 (vs RENEW_EVERY={RENEW_EVERY:.0f}s)")
+
+                while True:
+                    elapsed = time.time() - cycle_start
+                    if elapsed >= effective_renew:
+                        log(f"Predicted expiry reached ({elapsed:.0f}s) — staying in danger zone")
+                        cycle_start = time.time() - (effective_renew - DANGER_WINDOW)
+                        in_danger_zone = True
+                        continue
+                    remaining = effective_renew - elapsed
+                    if remaining <= DANGER_WINDOW:
+                        if not in_danger_zone:
+                            log(f"Entering danger zone ({remaining:.0f}s left) — heartbeat every {HEARTBEAT_FINE}s")
+                            in_danger_zone = True
+                        sleep_for = HEARTBEAT_FINE
+                    else:
+                        sleep_for = HEARTBEAT_COARSE
+
+                    time.sleep(sleep_for)
+                    remaining = max(0.0, effective_renew - (time.time() - cycle_start))
+                    auth_count_before = len(_auth_times)
+                    need_full_probe = heartbeat(page, remaining)
+                    if len(_auth_times) > auth_count_before:
+                        cycle_start = time.time()
+                        in_danger_zone = False
+                        effective_renew = RENEW_EVERY
+                        _blank_page(page)
+                        log("Heartbeat re-authed inline — cycle timer reset, back to safe zone")
+                    if need_full_probe:
+                        real_elapsed = time.time() - cycle_start
+                        if (not in_danger_zone and cycle == 1
+                                and first_cycle_authed
+                                and real_elapsed < _startup_renew):
+                            old = _startup_renew
+                            _startup_renew = max(RENEW_MIN, real_elapsed)
+                            log(f"[startup] Early expiry at {real_elapsed:.0f}s — startup_renew: {old:.0f}s -> {_startup_renew:.0f}s")
+                        need_verify = True
+                        log("Inline re-auth failed — doing full re-probe")
+                        break
+
+        except KeyboardInterrupt:
+            print("\nCtrl+C received — shutting down gracefully...")
+        except Exception as e:
+            print(f"\nFatal: {e}")
+            import traceback; traceback.print_exc()
+        finally:
+            n = len(_auth_times)
+            if n >= 2:
+                avg = (_auth_times[-1] - _auth_times[0]) / (n - 1)
+                _save_state(avg)
+                uptime = _auth_times[-1] - _auth_times[0]
+                print(f"\nSession summary:")
+                print(f"  Total auths   : {n}")
+                print(f"  Uptime tracked: {uptime/60:.1f} min")
+                print(f"  Avg interval  : {avg:.0f}s  (saved to state file)")
+            elif n == 1:
+                print(f"\nOnly 1 auth recorded — not enough data to save average.")
+            context.close()
+            browser.close()
+            print("Cleaned up.")
+
+
+if __name__ == "__main__":
+    main()

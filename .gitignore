@@ -10,3 +10,7 @@ updtdns.py
 docs/
 
 *.starrt_state.json
+
+*.env
+
+*.json

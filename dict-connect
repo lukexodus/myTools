@@ -1,0 +1,127 @@
+#!/bin/bash
+
+# ==============================================================================
+# dict-connect: Highly Robust Captive Portal Connector
+# ==============================================================================
+
+SSID_PATTERN="DICT Free Wi-Fi for All"
+CONNECTION_NAME="DICT Free Wi-Fi for All"
+STATIC_IP="172.16.5.181/21"
+STATIC_GW="172.16.1.1"
+STATIC_DNS="8.8.8.8,1.1.1.1"
+
+# Automatically find the Wi-Fi interface (usually wlan0)
+WIFI_DEV=$(nmcli -t -f DEVICE,TYPE device | awk -F: '$2=="wifi" {print $1}' | head -n1)
+if [ -z "$WIFI_DEV" ]; then
+    echo "❌ CRITICAL ERROR: Could not find any Wi-Fi network interface."
+    exit 1
+fi
+
+echo "📡 Scanning the airwaves for '$SSID_PATTERN' antennas with interface '$WIFI_DEV'..."
+
+# Extract a sorted list of BSSIDs and Signals (highest signal first)
+# Format: MAC_ADDRESS SIGNAL
+BSSID_LIST=$(nmcli -f BSSID,SIGNAL,SSID device wifi list | grep -E "$SSID_PATTERN" | awk '{print $1, $2}' | sort -k2 -nr)
+
+if [ -z "$BSSID_LIST" ]; then
+    echo "❌ Error: Could not find any active '$SSID_PATTERN' antennas in range."
+    exit 1
+fi
+
+echo "📋 Found the following candidate antennas:"
+echo "$BSSID_LIST" | awk '{print "   - " $1 " (Signal: " $2 "%)"}'
+echo "--------------------------------------------------"
+
+# Read the BSSIDs into an array for fallback
+mapfile -t BSSIDS < <(echo "$BSSID_LIST" | awk '{print $1}')
+
+# Reusable function to execute a connection attempt
+try_connect() {
+    local bssid=$1
+    local mode=$2
+
+    echo "🔌 Trying BSSID: $bssid (Mode: $mode) ..."
+    
+    # Configure NetworkManager Profile appropriately
+    if [ "$mode" == "static" ]; then
+        echo "   🔒 Configuring Static IP Bypass..."
+        sudo nmcli connection modify "$CONNECTION_NAME" \
+            802-11-wireless.bssid "$bssid" \
+            ipv4.method manual \
+            ipv4.addresses "$STATIC_IP" \
+            ipv4.gateway "$STATIC_GW" \
+            ipv4.dns "$STATIC_DNS" 2>/dev/null
+    else
+        echo "   🔄 Configuring Auto DHCP..."
+        sudo nmcli connection modify "$CONNECTION_NAME" \
+            802-11-wireless.bssid "$bssid" \
+            ipv4.method auto \
+            ipv4.addresses "" \
+            ipv4.gateway "" \
+            ipv4.dns "8.8.8.8,1.1.1.1" \
+            ipv4.ignore-auto-dns yes 2>/dev/null
+    fi
+
+    echo "   🚀 Activating connection (may take up to 20s)..."
+    
+    # 'nmcli connection up' returns 0 on success, >0 on failure
+    # We use a strict timeout just in case it completely hangs
+    if ! timeout 25 sudo nmcli connection up "$CONNECTION_NAME" > /dev/null 2>&1; then
+        echo "   ❌ Connection failed at Layer 2 (Timeout/Supplicant Error)."
+        return 1
+    fi
+
+    echo "   🔎 Layer 2 connected. Verifying routing table..."
+    
+    # Wait up to 15 seconds for a default gateway to appear for this specific interface
+    for i in {1..15}; do
+        if ip route | grep -q "default via.*dev $WIFI_DEV"; then
+            local gw
+            gw=$(ip route | grep "default via.*dev $WIFI_DEV" | awk '{print $3}' | head -n1)
+            echo "   ✅ Success! Network is fully up with gateway $gw."
+            return 0
+        fi
+        sleep 1
+    done
+
+    echo "   ❌ Routing failed (No default gateway found after 15 seconds)."
+    return 2 # Special code: Layer 2 OK but DHCP Exhaustion/No Gateway
+}
+
+# ==============================================================================
+# MAIN LOOP: Iterate through every BSSID in order of strongest to weakest
+# ==============================================================================
+for bssid in "${BSSIDS[@]}"; do
+    
+    # Attempt 1: Auto DHCP
+    try_connect "$bssid" "auto"
+    RESULT=$?
+    
+    if [ $RESULT -eq 0 ]; then
+        echo -e "\n🎉 Fully Resilient Connection Established! You are online."
+        echo "🔄 Automatically restarting 'starrt' background service..."
+        systemctl --user restart starrt.service || echo "   ⚠️  Note: starrt.service is not running or failed to restart."
+        exit 0
+    fi
+    
+    # Attempt 2: If Layer 2 succeeded but DHCP failed, try Static IP explicitly
+    if [ $RESULT -eq 2 ]; then
+        echo "   ⚠️ DHCP Exhaustion Detected! Automatically trying Static IP bypass..."
+        try_connect "$bssid" "static"
+        if [ $? -eq 0 ]; then
+            echo -e "\n🎉 Static Connection Established! You are bypassed and online."
+            echo "🔄 Automatically restarting 'starrt' background service..."
+            systemctl --user restart starrt.service || echo "   ⚠️  Note: starrt.service is not running or failed to restart."
+            exit 0
+        fi
+        echo "   ❌ Static IP bypass also failed..."
+    fi
+
+    echo "⚠️ Blacklisting BSSID $bssid and moving to the next strongest antenna..."
+    echo "--------------------------------------------------"
+done
+
+# If we exhaust the entire list
+echo "💀 CRITICAL ERROR: All BSSID antennas failed."
+echo "   The access points might be completely broken or blocking you."
+exit 1

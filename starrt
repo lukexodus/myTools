@@ -5,6 +5,8 @@ import datetime
 import re
 import json
 import os
+import socket
+import struct
 import urllib.request
 
 # ────────────────────────────────────────────────
@@ -30,6 +32,29 @@ def get_check_url():
     return url
 
 USER_AGENT       = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+
+def _get_gateway_url() -> str:
+    """
+    Return the default gateway as an HTTP URL by reading /proc/net/route.
+    Used as a DNS-free fallback when the captive portal blocks all DNS queries.
+    Wifidog intercepts HTTP to any host (including raw IPs), so navigating to
+    the gateway IP triggers the portal redirect chain without needing DNS.
+    Returns None if no default gateway is found.
+    """
+    try:
+        with open('/proc/net/route') as f:
+            for line in f:
+                fields = line.strip().split()
+                if len(fields) < 4:
+                    continue
+                # Destination=00000000 (default), Flags has RTF_GATEWAY (0x2)
+                if fields[1] == '00000000' and int(fields[3], 16) & 0x2:
+                    gw_hex = fields[2]
+                    gw_ip = socket.inet_ntoa(struct.pack('<L', int(gw_hex, 16)))
+                    return f"http://{gw_ip}"
+    except Exception:
+        pass
+    return None
 HEADLESS         = True
 HEARTBEAT_COARSE = 60      # interval (s) during safe window — just keep-alive pings
 HEARTBEAT_FINE   = 5       # interval (s) in danger zone — fast re-auth detection
@@ -174,7 +199,7 @@ def _record_auth():
 
 
 
-def _try_fresh_auth(page, retries: int = 2) -> bool:
+def _try_fresh_auth(page, retries: int = 2, dns_blocked: bool = False) -> bool:
     """
     Open a fresh browser CONTEXT (not just a new page) and navigate to
     CHECK_URL to force the gateway redirect chain.
@@ -186,10 +211,29 @@ def _try_fresh_auth(page, retries: int = 2) -> bool:
     a portal redirect. A new context has a fully isolated network stack — own
     connection pool, own cookies — so the gateway sees a brand-new first request.
 
+    dns_blocked: if True, navigate to the default gateway IP directly (bypasses DNS).
+                 Wifidog intercepts all HTTP traffic including direct IP requests,
+                 so this still triggers the portal redirect chain.
+
     Returns True if auth succeeded (gateway confirmed via dict.gov.ph redirect).
     """
     browser = page.context.browser
-    check_url = get_check_url()
+    # When DNS is blocked by an aggressive portal, domain names won't resolve.
+    # Navigate to the gateway IP directly — wifidog intercepts HTTP by IP too.
+    if dns_blocked:
+        gw_url = _get_gateway_url()
+        if not gw_url:
+            # heartbeat() should have already verified gateway exists before
+            # calling us with dns_blocked=True, but handle it defensively.
+            log("  DNS blocked but no gateway found — network not ready, backing off")
+            return _NETWORK_NOT_READY
+        # On Ruijie systems, hitting the gateway IP directly loads the admin GUI,
+        # not the captive portal. To trigger the intercept, we must send an HTTP
+        # request to a foreign IP. This bypasses DNS but still gets intercepted.
+        check_url = "http://1.1.1.1"
+        log(f"  DNS blocked — using external IP directly to trigger intercept: {check_url}")
+    else:
+        check_url = get_check_url()
     ctx_kwargs = dict(
         viewport={"width": 640, "height": 480},
         user_agent=USER_AGENT,
@@ -220,6 +264,13 @@ def _try_fresh_auth(page, retries: int = 2) -> bool:
             try:
                 fresh.goto(check_url, wait_until="commit", timeout=15_000)
             except Exception as eval_e:
+                err_str = str(eval_e)
+                if dns_blocked and "ERR_ADDRESS_UNREACHABLE" in err_str:
+                    # Gateway IP unreachable + DNS blocked = network interface
+                    # hasn't gotten its IP/route yet (DHCP still in progress).
+                    # This is NOT a captive portal — just wait for network to come up.
+                    log(f"  [fresh#{attempt}] Gateway unreachable — network still coming up, backing off")
+                    return False
                 log(f"  [fresh#{attempt}] goto error (ignoring if portal loads): {eval_e}")
 
             # Instead of networkidle (which hangs if a tracking pixel is stuck),
@@ -337,33 +388,41 @@ def do_auth(page):
         return True   # gateway confirmed via redirect — internet is live
     return False
 
-
-
-
-
-
-
-
-
-
-
-
 # ── verify ────────────────────────────────────────────────────────────────────
+
+# Sentinel returned by verify_connectivity() when DNS fails but the interface
+# is still up. Indicates the portal may be blocking DNS aggressively instead
+# of redirecting — should try re-auth rather than wait.
+_DNS_BLOCKED = "dns_blocked"
+
+# Sentinel returned by _try_fresh_auth() when there is no default gateway yet
+# (DHCP still in progress after iwd reassociation). Caller should stay in the
+# danger zone and retry instead of triggering a full re-probe cycle.
+_NETWORK_NOT_READY = "not_ready"
+
+# Timestamp of the last ERR_NETWORK_CHANGED event. Used to apply a cooldown
+# before treating DNS failure as a portal expiry signal — DNS can take a few
+# seconds to propagate after DHCP settles, even though the route is already up.
+_ROAM_COOLDOWN_S = 30   # seconds to wait after a network change before auth
+_last_network_change: float = 0.0
+
 
 def verify_connectivity():
     """
     Check internet access using Python's urllib directly (not the browser).
 
     Returns:
-      True   — connected (neverssl loaded without portal redirect)
-      False  — portal redirect detected (session expired, re-auth needed)
-      None   — network unreachable / hard error (interface down, no route)
-                 Unknown session state — caller should WAIT, not re-auth.
+      True          — connected (check URL loaded without portal redirect)
+      False         — portal redirect detected (session expired, re-auth needed)
+      None          — network physically unreachable (errno 101 ENETUNREACH /
+                      interface down). Caller should WAIT, not re-auth.
+      _DNS_BLOCKED  — DNS resolution failed (errno -3) but interface may still
+                      be up. Some portals block DNS on expiry instead of
+                      redirecting. Caller may attempt re-auth.
 
-    Distinguishing None from False is critical: errno 101 ENETUNREACH means
-    the network interface itself has no route. Treating that as 'session expired'
-    causes infinite re-auth loops that can never succeed because the portal is
-    also unreachable.
+    Distinguishing None from False/_DNS_BLOCKED is critical: errno 101 means
+    the interface has no route at all, so the portal is also unreachable and
+    any re-auth attempt would instantly fail.
     """
     try:
         check_url = get_check_url()
@@ -380,11 +439,14 @@ def verify_connectivity():
     except urllib.error.URLError as e:
         reason = getattr(e, 'reason', e)
         errno_val = getattr(reason, 'errno', None)
-        if errno_val == 101:  # ENETUNREACH — no route to host, interface down
+        if errno_val == 101:  # ENETUNREACH — no route, interface down
             log(f"  Verify: UNREACHABLE (network down: {reason})")
             return None
+        if errno_val == -3:   # EAI_AGAIN / NXDOMAIN — DNS blocked by portal
+            log(f"  Verify: DNS blocked (portal may be intercepting DNS: {reason})")
+            return _DNS_BLOCKED
         log(f"  Verify error: {e}")
-        return None   # any other hard error — also don't assume expired
+        return None   # any other hard error — wait, don't assume expired
     except Exception as e:
         log(f"  Verify error: {e}")
         return None
@@ -428,6 +490,14 @@ def heartbeat(page, remaining: float = 0) -> bool:
     except Exception as e:
         log(f"  Heartbeat error: {e}")
         timed_out = True
+        # ERR_NETWORK_CHANGED means iwd roamed to a different AP — the network
+        # interface itself changed. DNS failure here is a transient side-effect
+        # of DHCP renegotiation, NOT the portal blocking DNS. Record the time
+        # so the cooldown check below can suppress false auth triggers.
+        if "ERR_NETWORK_CHANGED" in str(e):
+            global _last_network_change
+            _last_network_change = time.time()
+            page._starrt_network_changed = True
     finally:
         page.remove_listener("framenavigated", on_nav)
 
@@ -442,12 +512,38 @@ def heartbeat(page, remaining: float = 0) -> bool:
                 log("  Heartbeat timeout but verify OK — session still live")
                 return False
             elif v is None:
-                # Network interface is down (ENETUNREACH, timeout, etc.)
+                # Network interface is down (ENETUNREACH, errno 101).
                 # Don't treat as session expired — portal is also unreachable.
                 # Just wait; the loop will retry on the next heartbeat.
                 log("  Heartbeat timeout + network down — waiting (not re-authing)")
                 return False
-            else:  # v is False — portal redirect confirmed
+            elif v is _DNS_BLOCKED:
+                # DNS is being blocked but interface is still up.
+                # Discriminate between two cases:
+                #   a) iwd roaming: DHCP not done, no default gateway yet → WAIT
+                #   b) portal expired: DHCP fine, only external DNS blocked → AUTH
+                # The gateway presence in /proc/net/route is the clean signal.
+                # Also apply a cooldown after ERR_NETWORK_CHANGED: even when the
+                # gateway comes back quickly, DNS takes a few seconds to propagate
+                # after DHCP settles. Without a cooldown, we'd false-trigger auth.
+                network_changed = getattr(page, '_starrt_network_changed', False)
+                page._starrt_network_changed = False  # reset
+                if network_changed:
+                    log("  Heartbeat timeout + DNS blocked after network change — waiting for DHCP to settle")
+                    return False
+                secs_since_roam = time.time() - _last_network_change
+                if secs_since_roam < _ROAM_COOLDOWN_S:
+                    log(f"  Heartbeat timeout + DNS blocked (in roam cooldown, {secs_since_roam:.0f}s/{_ROAM_COOLDOWN_S}s) — waiting")
+                    return False
+                gw = _get_gateway_url()
+                if not gw:
+                    log("  Heartbeat timeout + DNS blocked + no gateway — DHCP still settling, waiting")
+                    return False
+                # Gateway is up, DHCP is done — only the portal is blocking DNS.
+                log("  Heartbeat timeout + DNS blocked — assuming portal, attempting re-auth")
+                redirected = True
+                page._starrt_dns_blocked = True
+            else:  # v is False — urllib confirmed portal redirect
                 log("  Heartbeat timeout + verify: portal redirect — session expired")
                 redirected = True
         else:
@@ -458,9 +554,15 @@ def heartbeat(page, remaining: float = 0) -> bool:
 
     # ── Open a FRESH page to get sessionId — avoids TCP connection pool reuse ──
     log("  Attempting fresh-page re-auth...")
-    if _try_fresh_auth(page):
+    dns_blocked = getattr(page, '_starrt_dns_blocked', False)
+    page._starrt_dns_blocked = False   # reset
+    result = _try_fresh_auth(page, dns_blocked=dns_blocked)
+    if result is True:
         _blank_page(page)   # auth was done on a separate context; free main page DOM
         return False   # internet restored inline
+    if result is _NETWORK_NOT_READY:
+        log("  Network not ready (DHCP pending) — staying in danger zone, retrying")
+        return False   # stay in danger zone, don't trigger full re-probe
 
     # Clean the main page so probe() doesn't pick up stale framenavigated events
     try:
@@ -618,8 +720,46 @@ def main():
                 while True:
                     elapsed = time.time() - cycle_start
                     if elapsed >= effective_renew:
-                        # Past predicted expiry
-                        log(f"Predicted expiry reached ({elapsed:.0f}s) — staying in danger zone until portal redirects")
+                        # Past predicted expiry — check network before attempting auth
+                        v = verify_connectivity()
+                        if v is None:
+                            # Physical network down — portal unreachable, just wait
+                            log(f"Predicted expiry reached ({elapsed:.0f}s) but network down — waiting in danger zone")
+                            cycle_start = time.time() - (effective_renew - DANGER_WINDOW)
+                            in_danger_zone = True
+                            continue
+                        if v is _DNS_BLOCKED:
+                            # DNS blocked. Check if gateway exists to distinguish
+                            # iwd roaming (no gateway yet) from portal blocking (gateway up).
+                            if not _get_gateway_url():
+                                log(f"Predicted expiry reached ({elapsed:.0f}s) but DHCP still settling — waiting")
+                                cycle_start = time.time() - (effective_renew - DANGER_WINDOW)
+                                in_danger_zone = True
+                                continue
+                            # Gateway up, portal is blocking DNS — auth via gateway IP
+                            log(f"Predicted expiry reached ({elapsed:.0f}s) — trying fresh-page auth via gateway IP")
+                            if _try_fresh_auth(page, dns_blocked=True):
+                                cycle_start = time.time()
+                                in_danger_zone = False
+                                effective_renew = RENEW_EVERY
+                                _blank_page(page)
+                                log("Heartbeat re-authed inline — cycle timer reset, back to safe zone")
+                                continue
+                            log("Session still alive past prediction — staying in danger zone")
+                            cycle_start = time.time() - (effective_renew - DANGER_WINDOW)
+                            in_danger_zone = True
+                            continue
+                        log(f"Predicted expiry reached ({elapsed:.0f}s) — trying fresh-page auth before re-probe")
+                        if _try_fresh_auth(page):
+                            # Session was already expired and we re-authed inline
+                            cycle_start = time.time()
+                            in_danger_zone = False
+                            effective_renew = RENEW_EVERY
+                            _blank_page(page)   # free DOM after inline re-auth
+                            log("Heartbeat re-authed inline — cycle timer reset, back to safe zone")
+                            continue
+                        # Session still alive past prediction — stay in danger zone.
+                        log("Session still alive past prediction — staying in danger zone")
                         cycle_start = time.time() - (effective_renew - DANGER_WINDOW)
                         in_danger_zone = True
                         continue
