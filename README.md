@@ -93,6 +93,18 @@ Output: Line 1 Line 2
 
 ---
 
+#### `ds` - Double-Struck Text Converter
+**Functionality:** Converts text to mathematical double-struck (monospace bold) Unicode style  
+**Usage:**
+```bash
+./ds
+```
+**Input:** Text from clipboard  
+**Output:** Converted double-struck text copied to clipboard  
+**Example:** `hello world` → `𝚑𝚎𝚕𝚕𝚘 𝚠𝚘𝚛𝚕𝚍`
+
+---
+
 #### `tc` - Transform to Title Case
 **Functionality:** Converts text to Title Case (first letter of each word capitalized)  
 **Usage:**
