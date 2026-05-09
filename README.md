@@ -64,6 +64,21 @@ Output: Line 1 Line 2  Paragraph 2
 
 ---
 
+#### `rns` - Replace Literal "\\n" with Newlines
+**Functionality:** Converts literal backslash-n sequences ("\\n") into real newlines in the clipboard text.
+**Usage:**
+```bash
+./rns
+```
+**Example:**
+```
+Input:  Line1\\nLine2\\nLine3
+Output: Line1
+        Line2
+        Line3
+```
+
+
 #### `rnp` - Remove Single Newlines (Preserve Paragraphs)
 **Functionality:** Removes single newlines but preserves double newlines (paragraph breaks)  
 **Usage:**
@@ -326,6 +341,7 @@ All scripts use ultra-short, intuitive names for quick typing:
 |------|---------|----------|
 | `cc` | Colon Converter | Convert `::` for Anki |
 | `rna` | Remove Newlines All | Flatten all text |
+| `rns` | Replace Escaped Newlines | Convert literal "\\n" to real newlines |
 | `rnp` | Remove Newlines Preserve | Keep paragraphs |
 | `c1` | Cloze 1 | Set Anki cloze numbers |
 | `tc` | Title Case | Capitalize words |
